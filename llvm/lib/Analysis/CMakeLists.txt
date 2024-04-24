@@ -141,6 +141,19 @@ add_llvm_component_library(LLVMAnalysis
   ValueTracking.cpp
   VectorUtils.cpp
   VFABIDemangling.cpp
+  HACL/BasicPointsToAnalysis.cpp
+  HACL/ReachingDefinitionAnalysis.cpp
+  HACL/WARAnalysis.cpp
+  HACL/WAWAnalysis.cpp
+  HACL/RAWAnalysis.cpp
+  HACL/LiveVariableAnalysis.cpp
+  HACL/LiveIntervalAnalysis.cpp
+  HACL/MemoryUnitSelection.cpp
+  HACL/GemmStateAnalysis.cpp
+  HACL/GemmLiveVariableAnalysis.cpp
+  HACL/MemoryAllocation.cpp
+  HACL/GemmDMAAnalysis.cpp
+  HACL/Utils.cpp
   ${GeneratedMLSources}
 
   ADDITIONAL_HEADER_DIRS

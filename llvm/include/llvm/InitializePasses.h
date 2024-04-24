@@ -341,6 +341,23 @@ void initializeWinEHPreparePass(PassRegistry&);
 void initializeWriteBitcodePassPass(PassRegistry&);
 void initializeXRayInstrumentationPass(PassRegistry&);
 
+void initializeHACLBasicPointsToAnalysisPass(PassRegistry &);
+void initializeHACLReachDefinitionAnalysisPass(PassRegistry &);
+void initializeHACLRAWAnalysisPass(PassRegistry &);
+void initializeHACLWARAnalysisPass(PassRegistry &);
+void initializeHACLWAWAnalysisPass(PassRegistry &);
+void initializeHACLLiveVariableAnalysisPass(PassRegistry &);
+void initializeHACLLiveIntervalAnalysisPass(PassRegistry &);
+void initializeHACLMemoryUnitSelectionPass(PassRegistry &);
+void initializeHACLGemmStateAnalysisPass(PassRegistry &);
+void initializeHACLGemmLiveVariableAnalysisPass(PassRegistry &);
+void initializeHACLMemoryAllocationPass(PassRegistry &);
+void initializeHACLMemAllocaTransformPass(PassRegistry &);
+void initializeHACLGemmDMATransformPass(PassRegistry &);
+void initializeHACLGemmDMAAnalysisPass(PassRegistry &);
+void initializeLoopDedicatedExitInsertingPass(PassRegistry &);
+void initializeHACLSyncInsertTransformPass(PassRegistry &);
+
 } // end namespace llvm
 
 #endif // LLVM_INITIALIZEPASSES_H
