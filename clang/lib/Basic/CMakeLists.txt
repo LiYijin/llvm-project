@@ -93,6 +93,7 @@ add_clang_library(clangBasic
   Targets/AMDGPU.cpp
   Targets/ARC.cpp
   Targets/ARM.cpp
+  Targets/Ascend.cpp
   Targets/AVR.cpp
   Targets/BPF.cpp
   Targets/CSKY.cpp
