@@ -37,7 +37,10 @@ bool ReachingDefDFVisitor::VisitInst(Instruction *Inst,
         Ptrs.insert(Pointers.begin(), Pointers.end());
       }
     } else {
-      Ptrs.insert(Call->getArgOperand(0));
+      // Add this `if` condition for the case that the intrinsic has no arguments, such as llvm.hivm.GET.BLOCK.IDX
+      if(Call->arg_size() > 0) {
+        Ptrs.insert(Call->getArgOperand(0));
+      }
     }
   } else if (StoreInst *StInst = dyn_cast<StoreInst>(Inst)) {
     Ptrs.insert(StInst->getPointerOperand());
