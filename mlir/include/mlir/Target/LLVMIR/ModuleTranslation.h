@@ -80,8 +80,10 @@ public:
   /// given MLIR value.
   llvm::Value *&mapValue(Value value) {
     llvm::Value *&llvm = valueMapping[value];
-    assert(llvm == nullptr &&
-           "attempting to map a value that is already mapped");
+    // Note: We comment this assert, because we may need remap the value(map a
+    // new llvm::Value* for the same mlir::Value)
+    // assert(llvm == nullptr &&
+    //        "attempting to map a value that is already mapped");
     return llvm;
   }
 
