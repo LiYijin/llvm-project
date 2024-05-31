@@ -80,10 +80,25 @@ public:
   /// given MLIR value.
   llvm::Value *&mapValue(Value value) {
     llvm::Value *&llvm = valueMapping[value];
-    // Note: We comment this assert, because we may need remap the value(map a
-    // new llvm::Value* for the same mlir::Value)
-    // assert(llvm == nullptr &&
-    //        "attempting to map a value that is already mapped");
+    assert(llvm == nullptr &&
+           "attempting to map a value that is already mapped");
+    return llvm;
+  }
+
+  /// Provides write-again access to store the LLVM IR value corresponding to the
+  /// given MLIR value.
+  llvm::Value *&mapValueAgain(Value value) {
+    llvm::Value *&llvm = valueMapping[value];
+    // Note: this func copy from the above one, because we may need remap the value(map a
+    // new llvm::Value* for the same mlir::Value), in such situation:
+    //    The block argument in MLIR IR is mapped to a llvm phi node, but we
+    //    need this block argument to be mapped to a new llvm::Value*: a
+    //    GET_ADDR instruction(i.e. a UB space address which we allocated), so
+    //    we need to remap the value.
+    // i.e. We need to change the mapping relationship created by MLIR's 
+    // default translate behavior.
+    assert(llvm != nullptr &&
+           "attempting to map a value that not firstly mapped");
     return llvm;
   }
 
