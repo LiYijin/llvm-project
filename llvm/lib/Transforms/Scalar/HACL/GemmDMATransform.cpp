@@ -43,9 +43,9 @@ static int64_t GetDataMovConfig(uint16_t BurstNum, uint16_t BurstLen,
 }
 
 bool HACLGemmDMATransform::runOnFunction(Function &F) {
-  llvm::errs() << "HACLGemmDMATransform::runOnFunction: before execute: \n";
-  llvm::errs() << F << "\n";
-  llvm::errs() << "HACLGemmDMATransform::runOnFunction: before execute: end\n";
+  // llvm::errs() << "HACLGemmDMATransform::runOnFunction: before execute: \n";
+  // llvm::errs() << F << "\n";
+  // llvm::errs() << "HACLGemmDMATransform::runOnFunction: before execute: end\n";
   auto &Res = getAnalysis<HACLGemmDMAAnalysis>().getResult().GetResult();
   LLVMContext &Context = F.getContext();
   Function *L0CToUBF16 = getIntrinsic(F, Intrinsic::hivm_MOV_L0C32_TO_UB_f2h);
@@ -143,9 +143,9 @@ bool HACLGemmDMATransform::runOnFunction(Function &F) {
       Inst.setOperand(0, Dst);
     }
   }
-  llvm::errs() << "HACLGemmDMATransform::runOnFunction: after execute: \n";
-  llvm::errs() << F << "\n";
-  llvm::errs() << "HACLGemmDMATransform::runOnFunction: after execute: end\n";
+  // llvm::errs() << "HACLGemmDMATransform::runOnFunction: after execute: \n";
+  // llvm::errs() << F << "\n";
+  // llvm::errs() << "HACLGemmDMATransform::runOnFunction: after execute: end\n";
   return Res.Loads.size() || Res.Stores.size();
 }
 

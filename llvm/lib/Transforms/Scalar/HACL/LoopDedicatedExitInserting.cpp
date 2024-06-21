@@ -19,9 +19,9 @@ FunctionPass *llvm::createLoopDedicatedExitInsertingPass() {
 }
 
 bool LoopDedicatedExitInserting::runOnFunction(Function &F) {
-  llvm::errs() << "LoopDedicatedExitInserting::runOnFunction: before execute: \n";
-  llvm::errs() << F << "\n";
-  llvm::errs() << "LoopDedicatedExitInserting::runOnFunction: before execute: end\n";
+  // llvm::errs() << "LoopDedicatedExitInserting::runOnFunction: before execute: \n";
+  // llvm::errs() << F << "\n";
+  // llvm::errs() << "LoopDedicatedExitInserting::runOnFunction: before execute: end\n";
 
   auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
   auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
@@ -39,9 +39,9 @@ bool LoopDedicatedExitInserting::runOnFunction(Function &F) {
     formDedicatedExitBlocks(L, &DT, &LI, nullptr, false);
   }
 
-  llvm::errs() << "LoopDedicatedExitInserting::runOnFunction: after execute: \n";
-  llvm::errs() << F << "\n";
-  llvm::errs() << "LoopDedicatedExitInserting::runOnFunction: after execute: end\n";
+  // llvm::errs() << "LoopDedicatedExitInserting::runOnFunction: after execute: \n";
+  // llvm::errs() << F << "\n";
+  // llvm::errs() << "LoopDedicatedExitInserting::runOnFunction: after execute: end\n";
   return NoDedicatedExitLoops.size();
 }
 

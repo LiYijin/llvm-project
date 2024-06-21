@@ -62,9 +62,9 @@ EventIDType HACLSyncInsertTransform::mergeEventIDForPredecessors(
 }
 
 bool HACLSyncInsertTransform::runOnFunction(Function &F) {
-  llvm::errs() << "HACLSyncInsertTransform::runOnFunction: before execute: \n";
-  llvm::errs() << F << "\n";
-  llvm::errs() << "HACLSyncInsertTransform::runOnFunction: before execute: end\n";
+  // llvm::errs() << "HACLSyncInsertTransform::runOnFunction: before execute: \n";
+  // llvm::errs() << F << "\n";
+  // llvm::errs() << "HACLSyncInsertTransform::runOnFunction: before execute: end\n";
   auto &RAW = getAnalysis<HACLRAWAnalysis>().getResult();
   auto &WAR = getAnalysis<HACLWARAnalysis>().getResult();
   auto &WAW = getAnalysis<HACLWAWAnalysis>().getResult();
@@ -161,9 +161,9 @@ bool HACLSyncInsertTransform::runOnFunction(Function &F) {
     }
     BB_EventID[BB] = EventID;
   }
-  llvm::errs() << "HACLSyncInsertTransform::runOnFunction: after execute: \n";
-  llvm::errs() << F << "\n";
-  llvm::errs() << "HACLSyncInsertTransform::runOnFunction: after execute: end\n";
+  // llvm::errs() << "HACLSyncInsertTransform::runOnFunction: after execute: \n";
+  // llvm::errs() << F << "\n";
+  // llvm::errs() << "HACLSyncInsertTransform::runOnFunction: after execute: end\n";
   return true;
 }
 

@@ -167,8 +167,8 @@ void HACLMemAllocaTransform::RemoveUnusedObject(Instruction *Inst) {
 
 bool HACLMemAllocaTransform::runOnFunction(Function &F) {
 
-  errs() << "Before HACL Memory Allocation Transform Pass:\n";
-  errs() << F << "\n";
+  // errs() << "Before HACL Memory Allocation Transform Pass:\n";
+  // errs() << F << "\n";
 
   auto &MAI = getAnalysis<HACLMemoryAllocation>().getResult();
   auto &AddrMap = MAI.getAllAddressInfo();
@@ -209,8 +209,8 @@ bool HACLMemAllocaTransform::runOnFunction(Function &F) {
       updateWorkList(NewInst, WorkList);
   }
 
-  errs() << "After HACL Memory Allocation Transform Pass:\n";
-  errs() << F << "\n";
+  // errs() << "After HACL Memory Allocation Transform Pass:\n";
+  // errs() << F << "\n";
   return !AddrMap.empty();
 }
 
