@@ -309,6 +309,9 @@ def iPTR       : ValueType<0, 254>;
 // Pseudo valuetype to represent "any type of any size".
 def Any        : VTAny<255>;
 
+// TODO: This can stay here? after the above anyxxx types?
+def v64i128  : VTVec<64,  i128, 256>;  //  64 x i128 vector value
+
 } // end defset ValueTypes
 
 /// This class is for targets that want to use pointer types in patterns

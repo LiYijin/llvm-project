@@ -1,8 +1,8 @@
 add_llvm_component_library(LLVMScalarOpts
-  HACL/MemAllocaTransform.cpp
-  HACL/GemmDMATransform.cpp
-  HACL/LoopDedicatedExitInserting.cpp
-  HACL/SyncInsertTransform.cpp
+  # HACL/MemAllocaTransform.cpp
+  # HACL/GemmDMATransform.cpp
+  # HACL/LoopDedicatedExitInserting.cpp
+  # HACL/SyncInsertTransform.cpp
   ADCE.cpp
   AlignmentFromAssumptions.cpp
   AnnotationRemarks.cpp
