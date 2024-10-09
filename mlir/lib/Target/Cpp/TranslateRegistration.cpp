@@ -11,6 +11,7 @@
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/NPU/IR/NPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dialect.h"
@@ -46,6 +47,7 @@ void registerToCppTranslation() {
                         emitc::EmitCDialect,
                         func::FuncDialect,
                         math::MathDialect,
+                        npu::NPUDialect,
                         scf::SCFDialect>();
         // clang-format on
       });

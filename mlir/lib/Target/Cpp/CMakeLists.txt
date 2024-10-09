@@ -15,4 +15,5 @@ add_mlir_translation_library(MLIRTargetCpp
   MLIRSCFDialect
   MLIRSupport
   MLIRTranslateLib
+  MLIRINNPU
   )
