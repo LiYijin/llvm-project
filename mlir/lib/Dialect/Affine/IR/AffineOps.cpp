@@ -1446,7 +1446,14 @@ static void canonicalizeMapOrSetAndOperands(MapOrSet *mapOrSet,
   assert(mapOrSet->getNumInputs() == operands->size() &&
          "map/set inputs must match number of operands");
 
-  canonicalizePromotedSymbols<MapOrSet>(mapOrSet, operands);
+  // For using ASV(affine-super-vectorize) in my compile flow, I comment out
+  // this line. Because it will convert the dims to symbols, which will cause
+  // the ASV's output: vector.transfer_read/write to be wrong:
+  // vector.transfer_write can not have broadcast dim, but after converting dims
+  // to symbols, the ASV will generate broadcast dim for vector.transfer_write.
+  // So I comment out this function call.
+
+  // canonicalizePromotedSymbols<MapOrSet>(mapOrSet, operands);
 
   // Check to see what dims are used.
   llvm::SmallBitVector usedDims(mapOrSet->getNumDims());
