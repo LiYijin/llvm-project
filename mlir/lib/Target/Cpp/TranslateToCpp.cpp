@@ -84,6 +84,8 @@ inline LogicalResult interleaveAddWithError(const Container &c, raw_ostream &os,
 namespace {
 /// Emitter that uses dialect specific emitters to emit C++ code.
 struct CppEmitter {
+  std::unordered_map<int, Value> AllocationMap;
+
   explicit CppEmitter(raw_ostream &os, bool declareVariablesAtTop);
 
   /// Emits attribute or returns failure.
@@ -139,6 +141,9 @@ struct CppEmitter {
 
   /// Return the existing or a new label of a Block.
   StringRef getOrCreateName(Block &block);
+
+  // Return the allocated buffer name
+  StringRef getOrCreateNameAlias(Value val);
 
   /// Whether to map an mlir integer to a unsigned integer in C++.
   bool shouldMapToUnsigned(IntegerType::SignednessSemantics val);
@@ -361,14 +366,14 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   if(failed(emitter.emitType(movOutToUBOp.getLoc(), elemType)))
     return failure();
   os << " *)";
-  os << emitter.getOrCreateName(movOutToUBOp.getRes());
+  os << emitter.getOrCreateNameAlias(movOutToUBOp.getRes());
   // Here, has print: copy_gm_to_ubuf((__ubuf__ float *)i5, 
 
   os << ", (__gm__ ";
   if(failed(emitter.emitType(movOutToUBOp.getLoc(), elemType)))
     return failure();
   os << " *)";
-  os << emitter.getOrCreateName(movOutToUBOp.getSrcAddr());
+  os << emitter.getOrCreateNameAlias(movOutToUBOp.getSrcAddr());
   // Here, has print: copy_gm_to_ubuf((__ubuf__ float *)i5, (__gm__ float *)i4,
 
   if (vecType.getShape().size() != 1) {
@@ -415,14 +420,14 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   if(failed(emitter.emitType(movUBToOUTOp.getLoc(), elemType)))
     return failure();
   os << " *)";
-  os << emitter.getOrCreateName(movUBToOUTOp.getDstAddr());
+  os << emitter.getOrCreateNameAlias(movUBToOUTOp.getDstAddr());
   // Here, has print: copy_ubuf_to_gm((__gm__ float *)i9,
 
   os << ", (__ubuf__ ";
   if(failed(emitter.emitType(movUBToOUTOp.getLoc(), elemType)))
     return failure();
   os << " *)";
-  os << emitter.getOrCreateName(movUBToOUTOp.getValueToStore());
+  os << emitter.getOrCreateNameAlias(movUBToOUTOp.getValueToStore());
   // Here, has print: copy_ubuf_to_gm((__gm__ float *)i9, (__ubuf__ float *)i8,
 
   if (vecType.getShape().size() != 1) {
@@ -481,7 +486,7 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   if(failed(emitter.emitType(vAddF32Op.getLoc(), dstPtrType)))
     return failure();
   os << " )";
-  os << emitter.getOrCreateName(vAddF32Op.getRes());
+  os << emitter.getOrCreateNameAlias(vAddF32Op.getRes());
   os << ", ";
   // Here, has print: vadd((__ubuf__ float *)i8, 
 
@@ -497,7 +502,7 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   if(failed(emitter.emitType(vAddF32Op.getLoc(), src1PtrType)))
     return failure();
   os << " )";
-  os << emitter.getOrCreateName(vAddF32Op.getLhs());
+  os << emitter.getOrCreateNameAlias(vAddF32Op.getLhs());
   os << ", ";
   // Here, has print: vadd((__ubuf__ float *)i8, (__ubuf__ float *)i5, 
 
@@ -513,7 +518,7 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   if(failed(emitter.emitType(vAddF32Op.getLoc(), src2PtrType)))
     return failure();
   os << " )";
-  os << emitter.getOrCreateName(vAddF32Op.getRhs());
+  os << emitter.getOrCreateNameAlias(vAddF32Op.getRhs());
   os << ", ";
   // Here, has print: vadd((__ubuf__ float *)i8, (__ubuf__ float *)i5, (__ubuf__ float *)i7, 
 
@@ -528,6 +533,24 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   os << repeatTime << ", 1, 1, 1, 8, 8, 8)";
   // Here has print:
   //  vadd((__ubuf__ float *)i8, (__ubuf__ float *)i5, (__ubuf__ float *)i7, 1, 1, 1, 1, 8, 8, 8);
+  return success();
+}
+
+static LogicalResult printNPUOp(CppEmitter &emitter, npu::AllocaAddr op) {
+  auto Op = op.getOperation();
+  auto AllocationIndex =
+      Op->getAttrOfType<IntegerAttr>("ub-allocation-index").getInt();
+  auto &&AllocaRes = op.getVec();
+  emitter.AllocationMap[AllocationIndex] = AllocaRes;
+
+  raw_ostream &os = emitter.ostream();
+
+  os << "__ubuf__  uint8_t *";
+  os << emitter.getOrCreateName(AllocaRes);
+  os << " = (__ubuf__ uint8_t *)get_imm(";
+  os << op.getNumOffset();
+  os << ")";
+
   return success();
 }
 
@@ -1214,6 +1237,18 @@ StringRef CppEmitter::getOrCreateName(Block &block) {
   return *blockMapper.begin(&block);
 }
 
+StringRef CppEmitter::getOrCreateNameAlias(Value val) {
+  auto Defop = val.getDefiningOp();
+  if (Defop->hasAttr("ub-allocation-index")) {
+    auto AllocationIndex =
+        Defop->getAttrOfType<IntegerAttr>("ub-allocation-index").getInt();
+    if (AllocationMap.count(AllocationIndex)) {
+      return getOrCreateName(AllocationMap[AllocationIndex]);
+    }
+  }
+  return getOrCreateName(val);
+}
+
 bool CppEmitter::shouldMapToUnsigned(IntegerType::SignednessSemantics val) {
   switch (val) {
   case IntegerType::Signless:
@@ -1479,8 +1514,8 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
           // LLVM ops.
           .Case<LLVM::GEPOp>([&](auto op) { return printLLVMGEPOp(*this, op); })
           // NPU ops.
-          .Case<npu::MovOutToUBOp, npu::MovUBToOutOp, npu::VAddF32Op>(
-              [&](auto op) { return printNPUOp(*this, op); })
+          .Case<npu::MovOutToUBOp, npu::MovUBToOutOp, npu::VAddF32Op,
+                npu::AllocaAddr>([&](auto op) { return printNPUOp(*this, op); })
           .Default([&](Operation *) {
             return op.emitOpError("unable to find printer for op");
           });

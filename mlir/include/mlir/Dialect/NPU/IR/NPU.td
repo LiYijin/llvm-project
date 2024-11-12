@@ -254,6 +254,16 @@ def AllocaOp : NPU_Op<"alloca", [MemoryEffects<[MemAlloc]>]> {
   let results = (outs Res<LLVM_AnyPointer, "", [MemAlloc<AutomaticAllocationScopeResource>]>:$addrPtr);
 }
 
+def AllocaAddr : NPU_Op<"alloca_addr", [MemoryEffects<[MemAlloc]>]> {
+  let summary = "Alloca numBytes memory on ub at numOffset.";
+  let description = [{
+    Alloca numBytes memory on ub at numOffset.
+  }];
+
+  let arguments = (ins I64Attr:$numOffset,I64Attr:$numBytes);
+  let results = (outs Res<AnyVector, "", [MemAlloc<AutomaticAllocationScopeResource>]>:$vec);
+}
+
 // The reason why there are 2 types `mov_ub_to_ub`, is that at the beginning, 
 // the ub variable in NPU dialect is in the form of vector, after introducing
 // shared memory, the ub has another form: pointer, so design 2 `move_ub_to_ub`
