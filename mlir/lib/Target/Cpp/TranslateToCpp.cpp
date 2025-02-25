@@ -286,6 +286,10 @@ printBuiltinUnrealizedConversionOp(CppEmitter &emitter,
                                    UnrealizedConversionCastOp operation) {
   if (failed(emitter.emitAssignPrefix(*operation)))
     return failure();
+  raw_ostream &os = emitter.ostream();
+  os << "("; 
+  emitter.emitType(operation.getLoc(), operation->getResult(0).getType()); // require add type cast same to the operation's type
+  os << ")"; 
   if (failed(emitter.emitOperands(*operation)))
     return failure();
   return success();
@@ -348,7 +352,16 @@ static LogicalResult printLLVMGEPOp(CppEmitter &emitter,
 static LogicalResult printNPUOp(CppEmitter &emitter,
                                 npu::MovOutToUBOp movOutToUBOp) {
   raw_ostream &os = emitter.ostream();
-  os << "copy_gm_to_ubuf((__ubuf__ ";   // callee name
+  Operation::result_range results = movOutToUBOp->getResults();
+  if (!emitter.shouldDeclareVariablesAtTop()) {
+    for (OpResult result : results) {
+      if (failed(emitter.emitVariableDeclaration(result,
+                                                 /*trailingSemicolon=*/true)))
+        return failure();
+    }
+  }
+  // os << "copy_gm_to_ubuf((__ubuf__ ";   // callee name
+  os << "__memcpy(";   // callee name
 
   auto movType = movOutToUBOp.getRes().getType();   // Res type is vector<Nxf32>
   // TODO: Here should modify emitType() to print VectorType, but it has no
@@ -358,16 +371,17 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   auto vecType = movType.cast<VectorType>();
 
   auto elemType = vecType.getElementType();   // vector's element type, such as float
-  if(failed(emitter.emitType(movOutToUBOp.getLoc(), elemType)))
-    return failure();
-  os << " *)";
+  // if(failed(emitter.emitType(movOutToUBOp.getLoc(), elemType)))
+  //   return failure();
+  // os << " *)";
   os << emitter.getOrCreateName(movOutToUBOp.getRes());
   // Here, has print: copy_gm_to_ubuf((__ubuf__ float *)i5, 
 
-  os << ", (__gm__ ";
-  if(failed(emitter.emitType(movOutToUBOp.getLoc(), elemType)))
-    return failure();
-  os << " *)";
+  // os << ", (__gm__ ";
+  os << ", ";
+  // if(failed(emitter.emitType(movOutToUBOp.getLoc(), elemType)))
+  //   return failure();
+  // os << " *)";
   os << emitter.getOrCreateName(movOutToUBOp.getSrcAddr());
   // Here, has print: copy_gm_to_ubuf((__ubuf__ float *)i5, (__gm__ float *)i4,
 
@@ -388,8 +402,9 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
                      "ICT_ERROR(): mov_out_to_ub's res type's numElems is larger "
                      "than 256!");
   }
-  auto burstLen = numElems * elemType.getIntOrFloatBitWidth() / 256;
-  os << ", 0, 1, " << burstLen << ", 0, 0)";
+  auto burstLen = numElems * elemType.getIntOrFloatBitWidth() / 8;
+  // os << ", 0, 1, " << burstLen << ", 0, 0)";
+  os << ", " << burstLen << ", GDRAM2NRAM)";
   // Here has print: 
   //   copy_gm_to_ubuf((__ubuf__ float *)i5, (__gm__ float *)i4, 0, 1, 1, 0, 0);
   return success();
@@ -403,7 +418,8 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
 static LogicalResult printNPUOp(CppEmitter &emitter,
                                 npu::MovUBToOutOp movUBToOUTOp) {
   raw_ostream &os = emitter.ostream();
-  os << "copy_ubuf_to_gm((__gm__ ";   // callee name
+  // os << "copy_ubuf_to_gm((__gm__ ";   // callee name
+  os << "__memcpy(";   // callee name
   // get mov_ub_to_out's element type.
   auto movType = movUBToOUTOp.getValueToStore().getType();   // Res type is vector<Nxf32>
   assert(isa<VectorType>(movType) &&
@@ -412,16 +428,17 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   auto vecType = movType.cast<VectorType>();
 
   auto elemType = vecType.getElementType(); // vector's element type, such as float
-  if(failed(emitter.emitType(movUBToOUTOp.getLoc(), elemType)))
-    return failure();
-  os << " *)";
+  // if(failed(emitter.emitType(movUBToOUTOp.getLoc(), elemType)))
+    // return failure();
+  // os << " *)";
   os << emitter.getOrCreateName(movUBToOUTOp.getDstAddr());
   // Here, has print: copy_ubuf_to_gm((__gm__ float *)i9,
 
-  os << ", (__ubuf__ ";
-  if(failed(emitter.emitType(movUBToOUTOp.getLoc(), elemType)))
-    return failure();
-  os << " *)";
+  // os << ", (__ubuf__ ";
+  os << ", ";
+  // if(failed(emitter.emitType(movUBToOUTOp.getLoc(), elemType)))
+  //   return failure();
+  // os << " *)";
   os << emitter.getOrCreateName(movUBToOUTOp.getValueToStore());
   // Here, has print: copy_ubuf_to_gm((__gm__ float *)i9, (__ubuf__ float *)i8,
 
@@ -442,8 +459,9 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
                      "ICT_ERROR(): mov_ub_to_out's res type's numElems is larger "
                      "than 256!");
   }
-  auto burstLen = numElems * elemType.getIntOrFloatBitWidth() / 256;
-  os << ", 0, 1, " << burstLen << ", 0, 0)";
+  auto burstLen = numElems * elemType.getIntOrFloatBitWidth() / 8;
+  // os << ", 0, 1, " << burstLen << ", 0, 0)";
+  os << ", " << burstLen << ", NRAM2GDRAM)";
   // Here has print:
   //   copy_ubuf_to_gm((__gm__ float *)i9, (__ubuf__ float *)i8, 0, 1, 1, 0, 0);
   return success();
@@ -466,7 +484,13 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
 static LogicalResult printNPUOp(CppEmitter &emitter,
                                     npu::VAddF32Op vAddF32Op) {
   raw_ostream &os = emitter.ostream();
-  os << "vadd(";   // callee name
+  auto result = vAddF32Op->getResult(0);
+  if (!emitter.shouldDeclareVariablesAtTop()) {
+    if (failed(emitter.emitVariableDeclaration(result,
+                                                /*trailingSemicolon=*/true)))
+      return failure();
+  }
+  os << "__bang_add(";   // callee name
 
   // TODO: using lambda function. This following lambda run crash.
   // print dst addr
@@ -477,10 +501,10 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   auto dstElemType = dstVecType.getElementType();   // vector's element type, such as float
   // vadd's addrsapce must be 6.
   auto dstPtrType = LLVM::LLVMPointerType::get(dstElemType, 6);
-  os << "(";
-  if(failed(emitter.emitType(vAddF32Op.getLoc(), dstPtrType)))
-    return failure();
-  os << " )";
+  // os << "(";
+  // if(failed(emitter.emitType(vAddF32Op.getLoc(), dstPtrType)))
+  //   return failure();
+  // os << " )";
   os << emitter.getOrCreateName(vAddF32Op.getRes());
   os << ", ";
   // Here, has print: vadd((__ubuf__ float *)i8, 
@@ -493,10 +517,10 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   auto src1ElemType = src1VecType.getElementType();   // vector's element type, such as float
   // vadd's addrsapce must be 6.
   auto src1PtrType = LLVM::LLVMPointerType::get(src1ElemType, 6);
-  os << "(";
-  if(failed(emitter.emitType(vAddF32Op.getLoc(), src1PtrType)))
-    return failure();
-  os << " )";
+  // os << "(";
+  // if(failed(emitter.emitType(vAddF32Op.getLoc(), src1PtrType)))
+  //   return failure();
+  // os << " )";
   os << emitter.getOrCreateName(vAddF32Op.getLhs());
   os << ", ";
   // Here, has print: vadd((__ubuf__ float *)i8, (__ubuf__ float *)i5, 
@@ -509,10 +533,10 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   auto src2ElemType = src2VecType.getElementType();   // vector's element type, such as float
   // vadd's addrsapce must be 6.
   auto src2PtrType = LLVM::LLVMPointerType::get(src2ElemType, 6);
-  os << "(";
-  if(failed(emitter.emitType(vAddF32Op.getLoc(), src2PtrType)))
-    return failure();
-  os << " )";
+  // os << "(";
+  // if(failed(emitter.emitType(vAddF32Op.getLoc(), src2PtrType)))
+  //   return failure();
+  // os << " )";
   os << emitter.getOrCreateName(vAddF32Op.getRhs());
   os << ", ";
   // Here, has print: vadd((__ubuf__ float *)i8, (__ubuf__ float *)i5, (__ubuf__ float *)i7, 
@@ -524,8 +548,9 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
                      "ICT_ERROR(): vadd's numElems is not multiple of 8!");
   }
   // auto dstElemType = vAddF32Op.getRes().getType().cast<VectorType>().getElementType();
-  auto repeatTime = numElems * dstElemType.getIntOrFloatBitWidth() / 256;
-  os << repeatTime << ", 1, 1, 1, 8, 8, 8)";
+  // auto repeatTime = numElems * dstElemType.getIntOrFloatBitWidth() / 256;
+  os << numElems << ")";
+  // os << repeatTime << ", 1, 1, 1, 8, 8, 8)";
   // Here has print:
   //  vadd((__ubuf__ float *)i8, (__ubuf__ float *)i5, (__ubuf__ float *)i7, 1, 1, 1, 1, 8, 8, 8);
   return success();
@@ -948,7 +973,7 @@ static LogicalResult printOperation(CppEmitter &emitter, ModuleOp moduleOp) {
 static LogicalResult printOperation(CppEmitter &emitter,
                                     gpu::GPUModuleOp gpuModuleOp) {
   CppEmitter::Scope scope(emitter);
-
+  emitter.ostream() << "#include <bang.h>\n";
   for (Operation &op : gpuModuleOp) {
     if (failed(emitter.emitOperation(op, /*trailingSemicolon=*/false)))
       return failure();
@@ -1101,7 +1126,10 @@ static LogicalResult printOperation(CppEmitter &emitter,
 
   CppEmitter::Scope scope(emitter);
   raw_indented_ostream &os = emitter.ostream();
-  os << "extern \"C\" __global__ [aicore] ";
+  // if 910B3
+  // os << "extern \"C\" __global__ [aicore] ";
+  // if bang
+  os << "__mlu_global__ ";
   // Function return type.
   if (failed(emitter.emitTypes(functionOp.getLoc(),
                                functionOp.getFunctionType().getResults())))
@@ -1396,6 +1424,16 @@ LogicalResult CppEmitter::emitVariableDeclaration(OpResult result,
     return result.getDefiningOp()->emitError(
         "result variable for the operation already declared");
   }
+  if (result.getType().isa<VectorType>()) {
+    os << "__nram__ ";
+    auto vecType =  dyn_cast<VectorType>(result.getType());
+    // For MLU device, we treat vector type as its element type
+    if (failed(emitType(result.getOwner()->getLoc(), vecType.getElementType())))
+      return failure();
+    os << " " << getOrCreateName(result);
+    os << "[" << vecType.getNumElements() << "];\n";
+    return success();
+  }
   if (failed(emitType(result.getOwner()->getLoc(), result.getType())))
     return failure();
   os << " " << getOrCreateName(result);
@@ -1554,14 +1592,14 @@ LogicalResult CppEmitter::emitType(Location loc, Type type) {
   }
   if (auto memrefType = dyn_cast<MemRefType>(type)) {
     // Emit memory space.
-    if (memrefType.getMemorySpaceAsInt() == 1) {
-      os << "__gm__ ";
-    } else if (memrefType.getMemorySpaceAsInt() == 6) {
-      os << "__ubuf__ ";
-    } else {
-      return emitError(loc, "ICT_ERROR(): cannot emit MemRef memory space: ")
-             << memrefType.getMemorySpaceAsInt();
-    }
+    // if (memrefType.getMemorySpaceAsInt() == 1) {
+    //   os << "__gm__ ";
+    // } else if (memrefType.getMemorySpaceAsInt() == 6) {
+    //   os << "__ubuf__ ";
+    // } else {
+    //   return emitError(loc, "ICT_ERROR(): cannot emit MemRef memory space: ")
+    //          << memrefType.getMemorySpaceAsInt();
+    // }
     // Emit element type.
     if (auto fType = dyn_cast<FloatType>(memrefType.getElementType())) {
       if (fType.getWidth() == 32)
@@ -1582,14 +1620,14 @@ LogicalResult CppEmitter::emitType(Location loc, Type type) {
   if (auto llvmPtrType = dyn_cast<LLVM::LLVMPointerType>(type)) {
     Type elementType;
     if (llvmPtrType.getAddressSpace() == 1) {
-      os << "__gm__ ";
+      // os << "__gm__ ";
       if (llvmPtrType.isOpaque())
         elementType = IntegerType::get(llvmPtrType.getContext(), 8,
                                        IntegerType::Unsigned);
       else
         elementType = llvmPtrType.getElementType();
     } else if (llvmPtrType.getAddressSpace() == 6) {
-      os << "__ubuf__ ";
+      // os << "__ubuf__ ";
       if (llvmPtrType.isOpaque())
         elementType = Float32Type::get(llvmPtrType.getContext());
       else
