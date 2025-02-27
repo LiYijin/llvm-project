@@ -76,6 +76,8 @@ def VDivF32Op : NPU_Op<"vdiv_f32", [Pure]> {
   let builders = [
     OpBuilder<(ins "Value":$lhs, "Value":$rhs, "IntegerAttr":$numElems)>
   ];
+
+  let hasCanonicalizeMethod = 1;
 }
 
 def VExpF32Op : NPU_Op<"vexp_f32", [Pure]> {
@@ -190,6 +192,20 @@ def VTanhF32Op : NPU_Op<"vtanh_f32", [Pure]> {
   let builders = [
     OpBuilder<(ins "Value":$operand, "IntegerAttr":$numElems)>
   ];
+}
+
+def VRecipF32Op : NPU_Op<"vrecip_f32", [Pure]> {
+  let summary = "Vector float32 recip operation";
+  let description = [{
+    The `vrecip_f32` operation compute reciprocal value of input vector element-wise.
+  }];
+
+  let arguments = (ins AnyVector:$operand, I32Attr:$numElems);
+  let results = (outs AnyVector:$res);
+
+  let builders = [
+    OpBuilder<(ins "Value":$operand, "IntegerAttr":$numElems)>
+  ];  
 }
 
 def NPU_BlockIdOp : NPU_Op<"block_id", [Pure]> {

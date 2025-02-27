@@ -28,6 +28,8 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "mlir/Dialect/NPU/IR/NPUDialect.h"
 #include "llvm/Demangle/Demangle.h"
+#include "llvm/ADT/StringSwitch.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include <utility>
 
 #define DEBUG_TYPE "translate-to-cpp"
@@ -295,6 +297,121 @@ printBuiltinUnrealizedConversionOp(CppEmitter &emitter,
   return success();
 }
 
+static LogicalResult
+printOperation(CppEmitter &emitter,
+               arith::IndexCastOp operation) {
+  if (failed(emitter.emitAssignPrefix(*operation)))
+    return failure();
+  raw_ostream &os = emitter.ostream();
+  os << "(";
+  emitter.emitType(operation.getLoc(), operation->getResult(0).getType()); // require add type cast same to the operation's type
+  os << ")"; 
+  if (failed(emitter.emitOperands(*operation)))
+    return failure();
+  return success();
+}
+
+template <typename OpTy>
+static LogicalResult printArithBinaryOp(CppEmitter &emitter, OpTy arithOp,
+                                        StringRef opcode) {
+  auto &os = emitter.ostream();
+
+  auto lhs = arithOp.getLhs();
+  auto rhs = arithOp.getRhs();
+
+  if (failed(emitter.emitAssignPrefix(*arithOp.getOperation()))) {
+    arithOp->emitError("cannot declare variable");
+    return failure();
+  }
+
+  if (!emitter.hasValueInScope(lhs) || !emitter.hasValueInScope(rhs))
+    return failure();
+
+  os << "(" << emitter.getOrCreateName(lhs) << ") " << opcode << " ("
+     << emitter.getOrCreateName(rhs) << ")";
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+  arith::ShLIOp lshOp) {
+return printArithBinaryOp(emitter, lshOp, "<<");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+  arith::DivSIOp divOp) {
+return printArithBinaryOp(emitter, divOp, "/");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+  arith::DivUIOp divOp) {
+return printArithBinaryOp(emitter, divOp, "/");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+  arith::RemSIOp remOp) {
+return printArithBinaryOp(emitter, remOp, "%");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+  arith::RemUIOp remOp) {
+return printArithBinaryOp(emitter, remOp, "%");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+  arith::MulIOp mulOp) {
+return printArithBinaryOp(emitter, mulOp, "*");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+  arith::AddIOp addOp) {
+return printArithBinaryOp(emitter, addOp, "+");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+  arith::CmpIOp &cmpOp) {
+  auto &os = emitter.ostream();
+
+  auto lhs = cmpOp.getLhs();
+  auto rhs = cmpOp.getRhs();
+
+  if (failed(emitter.emitAssignPrefix(*cmpOp.getOperation())))
+  return failure();
+
+  if (!emitter.hasValueInScope(lhs) || !emitter.hasValueInScope(rhs))
+  return failure();
+
+  os << emitter.getOrCreateName(lhs);
+
+  switch (cmpOp.getPredicate()) {
+  case arith::CmpIPredicate::eq:
+  os << " == ";
+  break;
+  case arith::CmpIPredicate::ne:
+  os << " != ";
+  break;
+  case arith::CmpIPredicate::sge:
+  case arith::CmpIPredicate::uge:
+  os << " >= ";
+  break;
+  case arith::CmpIPredicate::sgt:
+  case arith::CmpIPredicate::ugt:
+  os << " > ";
+  break;
+  case arith::CmpIPredicate::sle:
+  case arith::CmpIPredicate::ule:
+  os << " <= ";
+  break;
+  case arith::CmpIPredicate::slt:
+  case arith::CmpIPredicate::ult:
+  os << " < ";
+  break;
+  }
+
+  os << emitter.getOrCreateName(rhs);
+
+  return success();
+}
+
 // For example, the gep operation:
 //   %4 = llvm.getelementptr %0[%3] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, f32
 //   ->
@@ -467,6 +584,136 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   return success();
 }
 
+static LogicalResult
+printNPUOp(CppEmitter &emitter, npu::LoadF32Op loadOp) {
+  auto &os = emitter.ostream();
+  auto result = loadOp->getResult(0);
+  if (failed(emitter.emitAssignPrefix(*loadOp.getOperation()))) {
+    return failure();
+  }
+
+  if (!emitter.hasValueInScope(loadOp.getSrcVector())) {
+    return loadOp->emitOpError("ICT_ERROR(): operator was not defined!");
+  }
+
+  os << emitter.getOrCreateName(loadOp.getSrcVector()) << "[0]";
+  return success();
+}
+
+static LogicalResult printNPUOp(CppEmitter &emitter, npu::AtomicAddF32Op op) {
+  auto &os = emitter.ostream();
+
+  auto dstAddr = op.getDstAddr();
+  auto valueToAdd = op.getValueToAdd();
+  auto numElems = op.getNumElems();
+
+  if (!emitter.hasValueInScope(dstAddr) ||
+      !emitter.hasValueInScope(valueToAdd)) {
+    return op->emitOpError("ICT_ERROR(): operator not defined!");
+  }
+
+  if(numElems % 8 != 0) {
+    return op->emitOpError("ICT_ERROR(): atomic_add's res type's numElems is not "
+                     "multiple of 8!");
+  }
+
+  os << "__bang_atomic_add(" << emitter.getOrCreateName(valueToAdd)
+     << ", " << emitter.getOrCreateName(dstAddr) << ", "
+     << emitter.getOrCreateName(valueToAdd) << ", "
+     << numElems << ")";
+  return success();
+}
+
+// Generic emitter for npu unary operations.
+template <typename OpTy>
+static LogicalResult printNPUUnaryOp(CppEmitter &emitter,
+                                     OpTy npuUOp) {
+  auto &os = emitter.ostream();
+  auto result = npuUOp->getResult(0);
+  if (!emitter.shouldDeclareVariablesAtTop()) {
+    if (failed(emitter.emitVariableDeclaration(result, true)))
+      return failure();
+  }
+
+  if (!emitter.hasValueInScope(npuUOp->getOperand(0))) {
+    return npuUOp->emitOpError("ICT_ERROR(): operator was not defined!");
+  }
+
+  auto intrinsic = llvm::StringSwitch<StringRef>(npuUOp->getName().stripDialect())
+      .Case("vtanh_f32", "__bang_active_tanh")
+      .Case("vexp_f32", "__bang_active_exp")
+      .Case("vrecip_f32", "__bang_active_recip")
+      .Case("movev_f32", "__bang_move") // FIXME
+      .Default(""); // TODO
+  
+  if (intrinsic.empty())
+    return npuUOp->emitOpError("ICT_ERROR(): unknown npu unary op!");
+
+  os << intrinsic << "(";
+
+  auto dstType = npuUOp.getType();
+  auto dstElemType = dstType.getElementType();
+  // npu binary's addrsapce must be 6.
+  auto dstPtrType = LLVM::LLVMPointerType::get(dstElemType, 6);
+  
+  os << emitter.getOrCreateName(npuUOp.getRes()) << ", "
+     << emitter.getOrCreateName(npuUOp->getOperand(0)) << ", ";
+  
+  auto numElems = npuUOp.getNumElems();
+  if (numElems % 8 != 0) {
+    return npuUOp->emitOpError("ICT_ERROR(): npu binary op's numElems is not multiple of 8!");
+  }
+   
+  os << numElems << ")";
+  return success();
+}
+
+// Generic emitter for npu binary operations.
+template <typename OpTy>
+static LogicalResult printNPUBinOp(CppEmitter &emitter,
+                                   OpTy npuBinOp) {
+  auto &os = emitter.ostream();
+  auto result = npuBinOp->getResult(0);
+  if (!emitter.shouldDeclareVariablesAtTop()) {
+    if (failed(emitter.emitVariableDeclaration(result, true)))
+      return failure();
+  }
+
+  if (!emitter.hasValueInScope(npuBinOp.getLhs()) ||
+      !emitter.hasValueInScope(npuBinOp.getRhs())) {
+    return npuBinOp->emitOpError("ICT_ERROR(): operator was not defined!");
+  }
+
+  auto intrinsic = llvm::StringSwitch<StringRef>(npuBinOp->getName().stripDialect())
+      .Cases("vadd_f32", "vadd", "__bang_add")
+      .Cases("vsub_f32", "vsub", "__bang_sub")
+      .Cases("vmul_f32", "vmul", "__bang_mul")
+      .Cases("vdiv_f32", "vdiv", "__bang_div")
+      .Default("");
+  
+  if (intrinsic.empty())
+    return npuBinOp->emitOpError("ICT_ERROR(): unknown binary op!");
+  
+  os << intrinsic << "(";
+
+  auto dstType = npuBinOp.getType();
+  auto dstElemType = dstType.getElementType();
+  // npu binary's addrsapce must be 6.
+  auto dstPtrType = LLVM::LLVMPointerType::get(dstElemType, 6);
+  
+  os << emitter.getOrCreateName(npuBinOp.getRes()) << ", "
+     << emitter.getOrCreateName(npuBinOp.getLhs()) << ", "
+     << emitter.getOrCreateName(npuBinOp.getRhs()) << ", ";
+
+  auto numElems = npuBinOp.getNumElems();
+  if (numElems % 8 != 0) {
+    return npuBinOp->emitOpError("ICT_ERROR(): npu binary op's numElems is not multiple of 8!");
+  }
+
+  os << numElems << ")";
+  return success();
+}
+
 // Process the npu.vadd operation:
 // %8 = "npu.vadd"(%5, %7) <{numElems = 8 : i32}> : (vector<8xf32>,
 // vector<8xf32>) -> vector<8xf32>
@@ -481,78 +728,79 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
 // 1次，每次有8个32B，111代表这8个32B之间是连续的，888表示大片段之间是连续的
 // vadd(dst, src1, src2, RepeatTime, DstBlock, SrcBlock0, SrcBlock1, DstStride,
 //      SrcStride0, SrcStride1)
+
+#define DEFINE_NPU_BINOP_EMITTER(OpTy) \
+static LogicalResult printNPUOp(CppEmitter &emitter,\
+                                npu::OpTy op) { \
+  return printNPUBinOp<>(emitter, op); \
+}
+
+DEFINE_NPU_BINOP_EMITTER(VAddF32Op)
+DEFINE_NPU_BINOP_EMITTER(VSubF32Op)
+DEFINE_NPU_BINOP_EMITTER(VMulF32Op)
+// DEFINE_NPU_BINOP_EMITTER(VDivF32Op)
+
+#undef DEFINE_NPU_BINOP_EMITTER
+
+#define DEFINE_NPU_UNARYOP_EMITTER(OpTy) \
+static LogicalResult printNPUOp(CppEmitter &emitter, OpTy op) {\
+  return printNPUUnaryOp<>(emitter, op); \
+}
+
+DEFINE_NPU_UNARYOP_EMITTER(npu::VExpF32Op)
+DEFINE_NPU_UNARYOP_EMITTER(npu::VTanhF32Op)
+DEFINE_NPU_UNARYOP_EMITTER(npu::VRecipF32Op)
+// DEFINE_NPU_UNARYOP_EMITTER(npu::MOVEVF32Op)
+
+#undef DEFINE_NPU_UNARYOP_EMITTER
+
 static LogicalResult printNPUOp(CppEmitter &emitter,
-                                    npu::VAddF32Op vAddF32Op) {
-  raw_ostream &os = emitter.ostream();
-  auto result = vAddF32Op->getResult(0);
+                                npu::MOVEVF32Op op) {
+  auto &os = emitter.ostream();
+  auto result = op->getResult(0);
   if (!emitter.shouldDeclareVariablesAtTop()) {
-    if (failed(emitter.emitVariableDeclaration(result,
-                                                /*trailingSemicolon=*/true)))
+    if (failed(emitter.emitVariableDeclaration(result, true)))
       return failure();
   }
-  os << "__bang_add(";   // callee name
 
-  // TODO: using lambda function. This following lambda run crash.
-  // print dst addr
-  auto dstType = vAddF32Op.getRes().getType();
-  assert(isa<VectorType>(dstType) &&
-         "ICT_ERROR(): vadd's res type is not vector type!");
-  auto dstVecType = dstType.cast<VectorType>();
-  auto dstElemType = dstVecType.getElementType();   // vector's element type, such as float
-  // vadd's addrsapce must be 6.
-  auto dstPtrType = LLVM::LLVMPointerType::get(dstElemType, 6);
-  // os << "(";
-  // if(failed(emitter.emitType(vAddF32Op.getLoc(), dstPtrType)))
-  //   return failure();
-  // os << " )";
-  os << emitter.getOrCreateName(vAddF32Op.getRes());
-  os << ", ";
-  // Here, has print: vadd((__ubuf__ float *)i8, 
-
-  // print src1 addr
-  auto src1Type = vAddF32Op.getLhs().getType();    // lhs type is vector<Nxf32>
-  assert(isa<VectorType>(src1Type) &&
-         "ICT_ERROR(): vadd's lhs type is not vector type!");
-  auto src1VecType = src1Type.cast<VectorType>();
-  auto src1ElemType = src1VecType.getElementType();   // vector's element type, such as float
-  // vadd's addrsapce must be 6.
-  auto src1PtrType = LLVM::LLVMPointerType::get(src1ElemType, 6);
-  // os << "(";
-  // if(failed(emitter.emitType(vAddF32Op.getLoc(), src1PtrType)))
-  //   return failure();
-  // os << " )";
-  os << emitter.getOrCreateName(vAddF32Op.getLhs());
-  os << ", ";
-  // Here, has print: vadd((__ubuf__ float *)i8, (__ubuf__ float *)i5, 
-
-  // print src2 addr
-  auto src2Type = vAddF32Op.getRhs().getType();    // rhs type is vector<Nxf32>
-  assert(isa<VectorType>(src2Type) &&
-         "ICT_ERROR(): vadd's rhs type is not vector type!");
-  auto src2VecType = src2Type.cast<VectorType>();
-  auto src2ElemType = src2VecType.getElementType();   // vector's element type, such as float
-  // vadd's addrsapce must be 6.
-  auto src2PtrType = LLVM::LLVMPointerType::get(src2ElemType, 6);
-  // os << "(";
-  // if(failed(emitter.emitType(vAddF32Op.getLoc(), src2PtrType)))
-  //   return failure();
-  // os << " )";
-  os << emitter.getOrCreateName(vAddF32Op.getRhs());
-  os << ", ";
-  // Here, has print: vadd((__ubuf__ float *)i8, (__ubuf__ float *)i5, (__ubuf__ float *)i7, 
-
-  // print configs.
-  auto numElems = vAddF32Op.getNumElems();
-  if(numElems % 8 != 0) {
-    return emitError(vAddF32Op.getLoc(),
-                     "ICT_ERROR(): vadd's numElems is not multiple of 8!");
+  if (!emitter.hasValueInScope(op->getOperand(0))) {
+    return op->emitOpError("ICT_ERROR(): operator was not defined!");
   }
-  // auto dstElemType = vAddF32Op.getRes().getType().cast<VectorType>().getElementType();
-  // auto repeatTime = numElems * dstElemType.getIntOrFloatBitWidth() / 256;
-  os << numElems << ")";
-  // os << repeatTime << ", 1, 1, 1, 8, 8, 8)";
-  // Here has print:
-  //  vadd((__ubuf__ float *)i8, (__ubuf__ float *)i5, (__ubuf__ float *)i7, 1, 1, 1, 1, 8, 8, 8);
+
+  auto numElems = op.getNumElems();
+  if (numElems % 8 != 0) {
+    return op->emitOpError("ICT_ERROR(): npu binary op's numElems is not multiple of 8!");
+  }
+  
+  os << "__bang_write_zero(" << emitter.getOrCreateName(result) 
+     << ", " << numElems << ");\n"
+     << "__bang_add_scalar(" << emitter.getOrCreateName(result)
+     << ", " << emitter.getOrCreateName(result)
+     << ", " << emitter.getOrCreateName(op->getOperand(0))
+     << ", " << numElems << ")";
+
+  return success();  
+}
+
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::BlockIdOp blockId) {
+  auto &os = emitter.ostream();
+
+  if (failed(emitter.emitAssignPrefix(*blockId.getOperation())))
+    return failure();
+  
+  os << "taskId";
+  return success();
+}
+
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::BlockNumOp blockNum) {
+  auto &os = emitter.ostream();
+
+  if (failed(emitter.emitAssignPrefix(*blockNum.getOperation())))
+    return failure();
+                                  
+  os << "taskDim";
   return success();
 }
 
@@ -859,8 +1107,16 @@ static LogicalResult printOperation(CppEmitter &emitter, scf::ForOp forOp) {
   for (auto pair : llvm::zip(iterArgs, yieldOp->getOperands())) {
     BlockArgument iterArg = std::get<0>(pair);
     Value operand = std::get<1>(pair);
-    os << emitter.getOrCreateName(iterArg) << " = "
-       << emitter.getOrCreateName(operand) << ";\n";
+    if (auto vecType = dyn_cast<VectorType>(operand.getType())) {
+      os << "__memcpy(" << emitter.getOrCreateName(iterArg) << ", "
+         << emitter.getOrCreateName(operand) << ", "
+         << vecType.getNumElements() << " * sizeof(";
+      (void)emitter.emitType(forOp.getLoc(), vecType.getElementType());
+      os << "), NRAM2NRAM);\n";
+    } else {
+      os << emitter.getOrCreateName(iterArg) << " = "
+         << emitter.getOrCreateName(operand) << ";\n";
+    }
   }
 
   os.unindent() << "}";
@@ -869,9 +1125,18 @@ static LogicalResult printOperation(CppEmitter &emitter, scf::ForOp forOp) {
   for (auto pair : llvm::zip(results, iterArgs)) {
     OpResult result = std::get<0>(pair);
     BlockArgument iterArg = std::get<1>(pair);
-    os << "\n"
-       << emitter.getOrCreateName(result) << " = "
-       << emitter.getOrCreateName(iterArg) << ";";
+
+    if (auto vecType = dyn_cast<VectorType>(iterArg.getType())) {
+      os << "\n__memcpy(" << emitter.getOrCreateName(result) << ", "
+         << emitter.getOrCreateName(iterArg) << ", "
+         << vecType.getNumElements() << " * sizeof(";
+      (void)emitter.emitType(forOp.getLoc(), vecType.getElementType());
+      os << "), NRAM2NRAM);";
+    } else {
+      os << "\n"
+          << emitter.getOrCreateName(result) << " = "
+          << emitter.getOrCreateName(iterArg) << ";";
+    }
   }
 
   return success();
@@ -1503,7 +1768,10 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
           .Case<scf::ForOp, scf::YieldOp>(
               [&](auto op) { return printOperation(*this, op); })
           // Arithmetic ops.
-          .Case<arith::ConstantOp>(
+          .Case<arith::ConstantOp, arith::IndexCastOp,
+                arith::AddIOp, arith::ShLIOp, arith::DivSIOp,
+                arith::RemSIOp, arith::DivUIOp, arith::RemUIOp,
+                arith::MulIOp, arith::CmpIOp>(
               [&](auto op) { return printOperation(*this, op); })
           .Case<emitc::LiteralOp>([&](auto op) { return success(); })
           // GPU ops.
@@ -1517,7 +1785,11 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
           // LLVM ops.
           .Case<LLVM::GEPOp>([&](auto op) { return printLLVMGEPOp(*this, op); })
           // NPU ops.
-          .Case<npu::MovOutToUBOp, npu::MovUBToOutOp, npu::VAddF32Op>(
+          .Case<npu::MovOutToUBOp, npu::MovUBToOutOp,
+                npu::VAddF32Op, npu::VSubF32Op, npu::VMulF32Op,
+                npu::VTanhF32Op, npu::VExpF32Op, npu::VRecipF32Op,
+                npu::MOVEVF32Op, npu::BlockIdOp, npu::BlockNumOp,
+                npu::LoadF32Op, npu::AtomicAddF32Op>(
               [&](auto op) { return printNPUOp(*this, op); })
           .Default([&](Operation *) {
             return op.emitOpError("unable to find printer for op");
@@ -1640,6 +1912,15 @@ LogicalResult CppEmitter::emitType(Location loc, Type type) {
     os << "*";
     return success();
   }
+
+  if (auto vecType = dyn_cast<VectorType>(type)) {
+    // os << "__nram__ ";
+    if (failed(emitType(loc, vecType.getElementType())))
+      return failure();
+    os << "*";
+    return success();
+  }
+
   return emitError(loc, "cannot emit type ") << type;
 }
 

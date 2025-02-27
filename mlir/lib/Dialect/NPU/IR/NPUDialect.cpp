@@ -71,6 +71,26 @@ void VDivF32Op::build(mlir::OpBuilder &builder, mlir::OperationState &state,
   VDivF32Op::build(builder, state, resType, lhs, rhs, numElements);
 }
 
+LogicalResult VDivF32Op::canonicalize(VDivF32Op divOp, PatternRewriter &rewriter) {
+  auto lhs = divOp.getLhs();
+  auto rhs = divOp.getRhs();
+  auto numElems = divOp.getNumElemsAttr();
+
+  Value recip = rewriter.create<VRecipF32Op>(divOp.getLoc(), rhs, numElems);
+  rewriter.replaceOpWithNewOp<VMulF32Op>(divOp, lhs, recip, numElems);
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// VRecipF32Op
+//===----------------------------------------------------------------------===//
+
+void VRecipF32Op::build(mlir::OpBuilder &builder, mlir::OperationState &state,
+                        Value operand, IntegerAttr numElements) {
+  auto resType = operand.getType();
+  VRecipF32Op::build(builder, state, resType, operand, numElements);
+}
+
 //===----------------------------------------------------------------------===//
 // VExpF32Op
 //===----------------------------------------------------------------------===//

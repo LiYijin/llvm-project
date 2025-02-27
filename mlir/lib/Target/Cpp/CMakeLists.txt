@@ -16,4 +16,8 @@ add_mlir_translation_library(MLIRTargetCpp
   MLIRSupport
   MLIRTranslateLib
   MLIRINNPU
+  MLIRGPUDialect
+
+  LINK_COMPONENTS
+  Demangle
   )

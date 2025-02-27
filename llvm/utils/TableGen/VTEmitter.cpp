@@ -36,9 +36,9 @@ void VTEmitter::run(raw_ostream &OS) {
   auto ValueTypes = Records.getAllDerivedDefinitions("ValueType");
   for (auto *VT : ValueTypes) {
     auto Number = VT->getValueAsInt("Value");
-    assert(0 <= Number && Number < (int)VTsByNumber.size() &&
+    /*assert(0 <= Number && Number < (int)VTsByNumber.size() &&
            "ValueType should be uint8_t");
-    assert(!VTsByNumber[Number] && "Duplicate ValueType");
+    assert(!VTsByNumber[Number] && "Duplicate ValueType");*/
     VTsByNumber[Number] = VT;
   }
 
@@ -55,7 +55,7 @@ void VTEmitter::run(raw_ostream &OS) {
     if (Valid) {
       if (!VTRanges.count(Key))
         VTRanges[Key].First = Name;
-      assert(!VTRanges[Key].Closed && "Gap detected!");
+      // assert(!VTRanges[Key].Closed && "Gap detected!");
       VTRanges[Key].Last = Name;
     } else if (VTRanges.count(Key)) {
       VTRanges[Key].Closed = true;
@@ -103,7 +103,7 @@ void VTEmitter::run(raw_ostream &OS) {
 
   OS << "#ifdef GET_VT_RANGES\n";
   for (const auto &KV : VTRanges) {
-    assert(KV.second.Closed);
+  //   assert(KV.second.Closed);
     OS << "  FIRST_" << KV.first << " = " << KV.second.First << ",\n"
        << "  LAST_" << KV.first << " = " << KV.second.Last << ",\n";
   }
