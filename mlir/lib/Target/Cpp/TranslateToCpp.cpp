@@ -18,6 +18,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/IndentedOstream.h"
 #include "mlir/Target/Cpp/CppEmitter.h"
 #include "llvm/ADT/DenseMap.h"
@@ -1055,6 +1056,23 @@ static LogicalResult printOperation(CppEmitter &emitter, scf::ForOp forOp) {
   Block::BlockArgListType iterArgs = forOp.getRegionIterArgs();
   Operation::result_range results = forOp.getResults();
 
+  auto genMoveNRam = [&](Value dst, Value src) -> LogicalResult {
+    if (dst.getType() != src.getType())
+      return failure();
+    
+    if (auto vecType = dyn_cast<VectorType>(dst.getType())) {
+      os << "__memcpy(" << emitter.getOrCreateName(dst) << ", "
+         << emitter.getOrCreateName(src) << ", " << vecType.getNumElements()
+         << " * sizeof(";
+      if (failed(emitter.emitType(forOp.getLoc(), vecType.getElementType())))
+        return failure();
+      
+      os << "), NRAM2NRAM);";
+      return success();
+    }
+    return failure();
+  };
+
   if (!emitter.shouldDeclareVariablesAtTop()) {
     for (OpResult result : results) {
       if (failed(emitter.emitVariableDeclaration(result,
@@ -1064,10 +1082,21 @@ static LogicalResult printOperation(CppEmitter &emitter, scf::ForOp forOp) {
   }
 
   for (auto pair : llvm::zip(iterArgs, operands)) {
-    if (failed(emitter.emitType(forOp.getLoc(), std::get<0>(pair).getType())))
-      return failure();
-    os << " " << emitter.getOrCreateName(std::get<0>(pair)) << " = ";
-    os << emitter.getOrCreateName(std::get<1>(pair)) << ";";
+    auto iterType = std::get<0>(pair).getType();
+    if (auto vecType = dyn_cast<VectorType>(iterType)) {
+      os << "__nram__ ";
+      if (failed(emitter.emitType(forOp.getLoc(), vecType.getElementType())))
+        return failure();
+      os << " " << emitter.getOrCreateName(std::get<0>(pair)) << "["
+         << vecType.getNumElements() << "];\n";
+      if (failed(genMoveNRam(std::get<0>(pair), std::get<1>(pair))))
+        return failure();  
+    } else {
+      if (failed(emitter.emitType(forOp.getLoc(), std::get<0>(pair).getType())))
+        return failure();
+      os << " " << emitter.getOrCreateName(std::get<0>(pair)) << " = ";
+      os << emitter.getOrCreateName(std::get<1>(pair)) << ";";
+    }
     os << "\n";
   }
 
@@ -1108,11 +1137,9 @@ static LogicalResult printOperation(CppEmitter &emitter, scf::ForOp forOp) {
     BlockArgument iterArg = std::get<0>(pair);
     Value operand = std::get<1>(pair);
     if (auto vecType = dyn_cast<VectorType>(operand.getType())) {
-      os << "__memcpy(" << emitter.getOrCreateName(iterArg) << ", "
-         << emitter.getOrCreateName(operand) << ", "
-         << vecType.getNumElements() << " * sizeof(";
-      (void)emitter.emitType(forOp.getLoc(), vecType.getElementType());
-      os << "), NRAM2NRAM);\n";
+      if (failed(genMoveNRam(iterArg, operand)))
+        return failure();
+      os << "\n";
     } else {
       os << emitter.getOrCreateName(iterArg) << " = "
          << emitter.getOrCreateName(operand) << ";\n";
@@ -1127,11 +1154,9 @@ static LogicalResult printOperation(CppEmitter &emitter, scf::ForOp forOp) {
     BlockArgument iterArg = std::get<1>(pair);
 
     if (auto vecType = dyn_cast<VectorType>(iterArg.getType())) {
-      os << "\n__memcpy(" << emitter.getOrCreateName(result) << ", "
-         << emitter.getOrCreateName(iterArg) << ", "
-         << vecType.getNumElements() << " * sizeof(";
-      (void)emitter.emitType(forOp.getLoc(), vecType.getElementType());
-      os << "), NRAM2NRAM);";
+      os << "\n";
+      if (failed(genMoveNRam(result, iterArg)))
+        return failure();
     } else {
       os << "\n"
           << emitter.getOrCreateName(result) << " = "
@@ -1495,8 +1520,15 @@ CppEmitter::CppEmitter(raw_ostream &os, bool declareVariablesAtTop)
 StringRef CppEmitter::getOrCreateName(Value val) {
   if (auto literal = dyn_cast_if_present<emitc::LiteralOp>(val.getDefiningOp()))
     return literal.getValue();
-  if (!valueMapper.count(val))
-    valueMapper.insert(val, formatv("v{0}", ++valueInScopeCount.top()));
+  if (!valueMapper.count(val)) {
+    APInt intVal;
+    if (matchPattern(val, m_ConstantInt(&intVal))) {
+      valueMapper.insert(val, formatv("c{0}_{1}", intVal.getZExtValue(),
+          ++valueInScopeCount.top()));
+    } else {
+      valueMapper.insert(val, formatv("v{0}", ++valueInScopeCount.top()));
+    }
+  }
   return *valueMapper.begin(val);
 }
 
