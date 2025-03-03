@@ -143,6 +143,9 @@ struct CppEmitter {
   /// Return the existing or a new label of a Block.
   StringRef getOrCreateName(Block &block);
 
+  /// Create a new name for a Value.
+  void createValueName(Value val, StringRef name);
+
   /// Whether to map an mlir integer to a unsigned integer in C++.
   bool shouldMapToUnsigned(IntegerType::SignednessSemantics val);
 
@@ -772,13 +775,10 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   if (numElems % 8 != 0) {
     return op->emitOpError("ICT_ERROR(): npu binary op's numElems is not multiple of 8!");
   }
-  
-  os << "__bang_write_zero(" << emitter.getOrCreateName(result) 
-     << ", " << numElems << ");\n"
-     << "__bang_add_scalar(" << emitter.getOrCreateName(result)
-     << ", " << emitter.getOrCreateName(result)
-     << ", " << emitter.getOrCreateName(op->getOperand(0))
-     << ", " << numElems << ")";
+
+  os << "__bang_write_value(" << emitter.getOrCreateName(result)
+     << ", " << numElems << ", "
+     << emitter.getOrCreateName(op->getOperand(0)) << ")";
 
   return success();  
 }
@@ -1082,14 +1082,13 @@ static LogicalResult printOperation(CppEmitter &emitter, scf::ForOp forOp) {
   }
 
   for (auto pair : llvm::zip(iterArgs, operands)) {
-    auto iterType = std::get<0>(pair).getType();
+    auto iterArg = std::get<0>(pair);
+    auto iterType = iterArg.getType();
+
     if (auto vecType = dyn_cast<VectorType>(iterType)) {
-      os << "__nram__ ";
-      if (failed(emitter.emitType(forOp.getLoc(), vecType.getElementType())))
-        return failure();
-      os << " " << emitter.getOrCreateName(std::get<0>(pair)) << "["
-         << vecType.getNumElements() << "];\n";
-      if (failed(genMoveNRam(std::get<0>(pair), std::get<1>(pair))))
+      auto iterVal = results[iterArg.getArgNumber()-1];
+      emitter.createValueName(iterArg, emitter.getOrCreateName(iterVal));
+      if (failed(genMoveNRam(iterArg, std::get<1>(pair))))
         return failure();  
     } else {
       if (failed(emitter.emitType(forOp.getLoc(), std::get<0>(pair).getType())))
@@ -1155,8 +1154,8 @@ static LogicalResult printOperation(CppEmitter &emitter, scf::ForOp forOp) {
 
     if (auto vecType = dyn_cast<VectorType>(iterArg.getType())) {
       os << "\n";
-      if (failed(genMoveNRam(result, iterArg)))
-        return failure();
+      //if (failed(genMoveNRam(result, iterArg)))
+      //  return failure();
     } else {
       os << "\n"
           << emitter.getOrCreateName(result) << " = "
@@ -1514,6 +1513,11 @@ CppEmitter::CppEmitter(raw_ostream &os, bool declareVariablesAtTop)
     : os(os), declareVariablesAtTop(declareVariablesAtTop) {
   valueInScopeCount.push(0);
   labelInScopeCount.push(0);
+}
+
+void CppEmitter::createValueName(Value val, StringRef name) {
+  assert(!valueMapper.count(val) && "The value already has a name!");
+  valueMapper.insert(val, name.str());
 }
 
 /// Return the existing or a new name for a Value.
