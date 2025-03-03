@@ -397,11 +397,11 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
                      "ICT_ERROR(): mov_out_to_ub's res type's numElems is not "
                      "multiple of 8!");
   }
-  if(numElems > 256) {
-    return emitError(movOutToUBOp.getLoc(),
-                     "ICT_ERROR(): mov_out_to_ub's res type's numElems is larger "
-                     "than 256!");
-  }
+  // if(numElems > 256) {
+  //   return emitError(movOutToUBOp.getLoc(),
+  //                    "ICT_ERROR(): mov_out_to_ub's res type's numElems is larger "
+  //                    "than 256!");
+  // }
   auto burstLen = numElems * elemType.getIntOrFloatBitWidth() / 8;
   // os << ", 0, 1, " << burstLen << ", 0, 0)";
   os << ", " << burstLen << ", GDRAM2NRAM)";
@@ -454,11 +454,11 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
                      "ICT_ERROR(): mov_ub_to_out's res type's numElems is not "
                      "multiple of 8!");
   }
-  if(numElems > 256) {
-    return emitError(movUBToOUTOp.getLoc(),
-                     "ICT_ERROR(): mov_ub_to_out's res type's numElems is larger "
-                     "than 256!");
-  }
+  // if(numElems > 256) {
+  //   return emitError(movUBToOUTOp.getLoc(),
+  //                    "ICT_ERROR(): mov_ub_to_out's res type's numElems is larger "
+  //                    "than 256!");
+  // }
   auto burstLen = numElems * elemType.getIntOrFloatBitWidth() / 8;
   // os << ", 0, 1, " << burstLen << ", 0, 0)";
   os << ", " << burstLen << ", NRAM2GDRAM)";
