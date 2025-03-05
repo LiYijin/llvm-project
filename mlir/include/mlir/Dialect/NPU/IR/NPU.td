@@ -22,6 +22,24 @@ def NPU_Dialect : Dialect {
 class NPU_Op<string mnemonic, list<Trait> traits = []> 
   : Op<NPU_Dialect, mnemonic, traits>;
 
+def SetFlag : NPU_Op<"set_flag", []> {
+  let summary = "Set flag operation";
+  let description = [{
+    The `set_flag` operation sets the flag.
+  }];
+
+  let arguments = (ins I32Attr:$pipeA, I32Attr:$pipeB, I32Attr:$PhyID);
+}
+
+def WaitFlag : NPU_Op<"wait_flag", []> {
+  let summary = "Wait flag operation";
+  let description = [{
+    The `wait_flag` operation waits for the flag.
+  }];
+
+  let arguments = (ins I32Attr:$pipeA, I32Attr:$pipeB, I32Attr:$PhyID);
+}
+
 def VAddF32Op : NPU_Op<"vadd", [Pure]> {
   let summary = "Vector add operation";
   let description = [{
