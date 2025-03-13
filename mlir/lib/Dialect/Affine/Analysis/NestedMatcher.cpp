@@ -42,6 +42,8 @@ llvm::BumpPtrAllocator *&NestedPattern::allocator() {
 }
 
 void NestedPattern::copyNestedToThis(ArrayRef<NestedPattern> nested) {
+  llvm::errs() << "NestedPattern::copyNestedToThis(): nested.empty(): "
+               << nested.empty() << "\n";
   if (nested.empty())
     return;
 
@@ -139,36 +141,44 @@ NestedPattern Op(FilterFunctionType filter) {
 }
 
 NestedPattern If(const NestedPattern &child) {
+  llvm::errs() << "Enter 1st If\n";
   return NestedPattern(child, isAffineIfOp);
 }
 NestedPattern If(const FilterFunctionType &filter, const NestedPattern &child) {
+  llvm::errs() << "Enter 2nd If\n";
   return NestedPattern(child, [filter](Operation &op) {
     return isAffineIfOp(op) && filter(op);
   });
 }
 NestedPattern If(ArrayRef<NestedPattern> nested) {
+  llvm::errs() << "Enter 3rd If\n";
   return NestedPattern(nested, isAffineIfOp);
 }
 NestedPattern If(const FilterFunctionType &filter,
                  ArrayRef<NestedPattern> nested) {
+  llvm::errs() << "Enter 4th If\n";
   return NestedPattern(nested, [filter](Operation &op) {
     return isAffineIfOp(op) && filter(op);
   });
 }
 
 NestedPattern For(const NestedPattern &child) {
+  llvm::errs() << "Enter 1st For\n";
   return NestedPattern(child, isAffineForOp);
 }
 NestedPattern For(const FilterFunctionType &filter,
                   const NestedPattern &child) {
+  llvm::errs() << "Enter 2nd For\n";
   return NestedPattern(
       child, [=](Operation &op) { return isAffineForOp(op) && filter(op); });
 }
 NestedPattern For(ArrayRef<NestedPattern> nested) {
+  llvm::errs() << "Enter 3rd For\n";
   return NestedPattern(nested, isAffineForOp);
 }
 NestedPattern For(const FilterFunctionType &filter,
                   ArrayRef<NestedPattern> nested) {
+  llvm::errs() << "Enter 4th For\n";
   return NestedPattern(
       nested, [=](Operation &op) { return isAffineForOp(op) && filter(op); });
 }

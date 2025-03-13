@@ -1452,8 +1452,10 @@ static void canonicalizeMapOrSetAndOperands(MapOrSet *mapOrSet,
   // vector.transfer_write can not have broadcast dim, but after converting dims
   // to symbols, the ASV will generate broadcast dim for vector.transfer_write.
   // So I comment out this function call.
+  // Update: Here I uncomment it, beacuse the compile flow changed, this function
+  // do not prevent the compile flow.
 
-  // canonicalizePromotedSymbols<MapOrSet>(mapOrSet, operands);
+  canonicalizePromotedSymbols<MapOrSet>(mapOrSet, operands);
 
   // Check to see what dims are used.
   llvm::SmallBitVector usedDims(mapOrSet->getNumDims());
