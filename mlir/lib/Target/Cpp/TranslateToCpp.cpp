@@ -36,6 +36,9 @@ using namespace mlir;
 using namespace mlir::emitc;
 using llvm::formatv;
 
+// #define GEN_CCE_CODE
+#define GEN_BISHENGCPP_CODE
+
 /// Convenience functions to produce interleaved output with functions returning
 /// a LogicalResult. This is different than those in STLExtras as functions used
 /// on each element doesn't return a string.
@@ -340,6 +343,70 @@ static LogicalResult printLLVMGEPOp(CppEmitter &emitter,
   return failure();
 }
 
+#ifdef GEN_BISHENGCPP_CODE
+// Process the npu.mov_out_to_ub operation:
+//   %5 = "npu.mov_out_to_ub"(%4) <{numElems = 8 : i32}> : (!llvm.ptr<1>) ->
+//   vector<8xf32>
+//   ->
+//   dmi::memcpy_elems(i5.data(), i4, 8);
+//      (copy 8 elements from i4 to i5)
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::MovOutToUBOp movOutToUBOp) {
+  raw_ostream &os = emitter.ostream();
+  // MLIR is SSA, so the `res` of mov_out_to_ub has not used and not declared
+  // before, here is the 1st time use it. So we can alloca UB vector here.
+  // TODO: But, theoretically, we should add npu.alloca() before this stage, and
+  // use npu.mov_out_to_ub() by this way: npu.mov_out_to_ub(dst_ub, src_gm). Now
+  // it is just a temporary solution.
+
+  // print alloca UB vector, like: vector<float, 8> i5;
+  // get element type and numElems of res.
+  auto movType = movOutToUBOp.getRes().getType();   // Res type is vector<Nxf32>
+  // TODO: Here should modify emitType() to print VectorType, but it has no
+  // addrspace info, so temporarily process it here.
+  assert(isa<VectorType>(movType) &&
+         "ICT_ERROR(): mov_out_to_ub's res type is not vector type!");
+  auto vecType = movType.cast<VectorType>();
+  auto elemType = vecType.getElementType();   // vector's element type, such as float
+  if (vecType.getShape().size() != 1) {
+    return emitError(movOutToUBOp.getLoc(),
+                     "ICT_ERROR(): mov_out_to_ub's res type is not 1D vector!");
+  }
+  auto numElems = vecType.getShape()[0];
+  // NPU should has no basic type which size > float(i.e. 4 bytes), so here mod
+  // 8 is enough.
+  if (numElems % 8 != 0) {
+    return emitError(movOutToUBOp.getLoc(),
+                     "ICT_ERROR(): mov_out_to_ub's res type's numElems is not "
+                     "multiple of 8!");
+  }
+  if(numElems > 256) {
+    return emitError(movOutToUBOp.getLoc(),
+                     "ICT_ERROR(): mov_out_to_ub's res type's numElems is larger "
+                     "than 256!");
+  }
+
+  os << "vector<";
+  if(failed(emitter.emitType(movOutToUBOp.getLoc(), elemType)))
+    return failure();
+  os << ", ";
+  os << numElems;
+  os << "> ";
+  os << emitter.getOrCreateName(movOutToUBOp.getRes());
+  os << ";\n";
+  // Here, has print: vector<float, 8> i5;
+
+  os << "dmi::memcpy_elems(";   // callee name
+  os << emitter.getOrCreateName(movOutToUBOp.getRes());
+  os << ".data(), ";
+  os << emitter.getOrCreateName(movOutToUBOp.getSrcAddr());
+  os << ", ";
+  os << numElems;
+  os << ")";
+  // Here, has print: dmi::memcpy_elems(i5.data(), i4, 8);
+  return success();
+}
+#else 
 // Process the npu.mov_out_to_ub operation:
 //   %5 = "npu.mov_out_to_ub"(%4) <{numElems = 8 : i32}> : (!llvm.ptr<1>) ->
 //   vector<8xf32>
@@ -399,7 +466,57 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   //   copy_gm_to_ubuf((__ubuf__ float *)i5, (__gm__ float *)i4, 0, 1, 1, 0, 0);
   return success();
 }
+#endif
 
+
+#ifdef GEN_BISHENGCPP_CODE
+// Process the npu.mov_ub_to_out operation:
+//   "npu.mov_ub_to_out"(%9, %8) <{numElems = 8 : i32}> : (!llvm.ptr<1>, vector<8xf32>) -> ()
+//   ->
+//   dmi::memcpy_elems(i9, i8.data(), 8);
+//      (copy 8 elements from i8 to i9)
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::MovUBToOutOp movUBToOUTOp) {
+  raw_ostream &os = emitter.ostream();
+
+  // get numElems of res.
+  // valueToStore type is vector<Nxf32>
+  auto movType = movUBToOUTOp.getValueToStore().getType();
+  // TODO: Here should modify emitType() to print VectorType, but it has no
+  // addrspace info, so temporarily process it here.
+  assert(isa<VectorType>(movType) &&
+         "ICT_ERROR(): mov_ub_to_out's res type is not vector type!");
+  auto vecType = movType.cast<VectorType>();
+  if (vecType.getShape().size() != 1) {
+    return emitError(movUBToOUTOp.getLoc(),
+                     "ICT_ERROR(): mov_ub_to_out's res type is not 1D vector!");
+  }
+  auto numElems = vecType.getShape()[0];
+  // NPU should has no basic type which size > float(i.e. 4 bytes), so here mod
+  // 8 is enough.
+  if (numElems % 8 != 0) {
+    return emitError(movUBToOUTOp.getLoc(),
+                     "ICT_ERROR(): mov_ub_to_out's res type's numElems is not "
+                     "multiple of 8!");
+  }
+  if(numElems > 256) {
+    return emitError(movUBToOUTOp.getLoc(),
+                     "ICT_ERROR(): mov_ub_to_out's res type's numElems is larger "
+                     "than 256!");
+  }
+
+  os << "dmi::memcpy_elems(";   // callee name
+  os << emitter.getOrCreateName(movUBToOUTOp.getDstAddr());
+  os << ", ";
+  os << emitter.getOrCreateName(movUBToOUTOp.getValueToStore());
+  os << ".data(), ";
+  os << numElems;
+  os << ");";
+  // Here, has print: dmi::memcpy_elems(i9, i8.data(), 8);
+
+  return success();
+}
+#else 
 // Process the npu.mov_ub_to_out operation:
 // "npu.mov_ub_to_out"(%9, %8) <{numElems = 8 : i32}> : (!llvm.ptr<1>, vector<8xf32>) -> ()
 // ->
@@ -453,7 +570,57 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   //   copy_ubuf_to_gm((__gm__ float *)i9, (__ubuf__ float *)i8, 0, 1, 1, 0, 0);
   return success();
 }
+#endif
 
+// Because we translate from CUDA, CUDA in MLIR is SSA, so instructions like
+// mov_out_to_ub, vadd, etc, their res is not used before, so we need alloca UB
+// vector here. So here, we assume the npu.vadd's res is also 1st time used, so we
+// need alloca UB vector here.
+#ifdef GEN_BISHENGCPP_CODE
+// Process the npu.vadd operation:
+// %8 = "npu.vadd"(%5, %7) <{numElems = 8 : i32}> : (vector<8xf32>,
+// vector<8xf32>) -> vector<8xf32>
+// ->
+// vec_add(i8, i5, i7);
+//    (add 8 elements from i5 and i7 to i8)
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                    npu::VAddF32Op vAddF32Op) {
+  raw_ostream &os = emitter.ostream();
+  // print alloca UB vector, like: vector<float, 8> i8;
+  // get element type and numElems of res.
+  auto dstType = vAddF32Op.getRes().getType();
+  assert(isa<VectorType>(dstType) &&
+         "ICT_ERROR(): vadd's res type is not vector type!");
+  auto vecType = dstType.cast<VectorType>();
+  auto elemType = vecType.getElementType();   // vector's element type, such as float
+  auto numElems = vAddF32Op.getNumElems();
+  if(numElems % 8 != 0) {
+    return emitError(vAddF32Op.getLoc(),
+                     "ICT_ERROR(): vadd's numElems is not multiple of 8!");
+  }
+  
+  os << "vector<";
+  if(failed(emitter.emitType(vAddF32Op.getLoc(), elemType)))
+    return failure();
+  os << ", ";
+  os << numElems;
+  os << "> ";
+  os << emitter.getOrCreateName(vAddF32Op.getRes());
+  os << ";\n";
+  // Here, has print: vector<float, 8> i8;
+
+  os << "vec_add(";   // callee name
+  os << emitter.getOrCreateName(vAddF32Op.getRes());
+  os << ", ";
+  os << emitter.getOrCreateName(vAddF32Op.getLhs());
+  os << ", ";
+  os << emitter.getOrCreateName(vAddF32Op.getRhs());
+  os << ")";
+  // Here has print:
+  //  vec_add(i8, i5, i7);
+  return success();
+}
+#else
 // Process the npu.vadd operation:
 // %8 = "npu.vadd"(%5, %7) <{numElems = 8 : i32}> : (vector<8xf32>,
 // vector<8xf32>) -> vector<8xf32>
@@ -535,6 +702,7 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   //  vadd((__ubuf__ float *)i8, (__ubuf__ float *)i5, (__ubuf__ float *)i7, 1, 1, 1, 1, 8, 8, 8);
   return success();
 }
+#endif
 
 static LogicalResult printBinaryOperation(CppEmitter &emitter,
                                           Operation *operation,
@@ -954,6 +1122,12 @@ static LogicalResult printOperation(CppEmitter &emitter,
                                     gpu::GPUModuleOp gpuModuleOp) {
   CppEmitter::Scope scope(emitter);
 
+  // Print header for bishengCpp kernel function.
+#ifdef GEN_BISHENGCPP_CODE
+  raw_ostream &os = emitter.ostream();
+  os << "#include <bisheng/bisheng.hpp>\n";
+#endif
+
   for (Operation &op : gpuModuleOp) {
     if (failed(emitter.emitOperation(op, /*trailingSemicolon=*/false)))
       return failure();
@@ -1106,7 +1280,12 @@ static LogicalResult printOperation(CppEmitter &emitter,
 
   CppEmitter::Scope scope(emitter);
   raw_indented_ostream &os = emitter.ostream();
+  // Print function signature.
+#ifdef GEN_BISHENGCPP_CODE
+  os << "extern \"C\" __global__ __aivector__ ";
+#else
   os << "extern \"C\" __global__ [aicore] ";
+#endif
   // Function return type.
   if (failed(emitter.emitTypes(functionOp.getLoc(),
                                functionOp.getFunctionType().getResults())))
@@ -1136,6 +1315,10 @@ static LogicalResult printOperation(CppEmitter &emitter,
     return failure();
   os << ") {\n";
   os.indent();
+  // Print `using namespace bisheng` for bishengCpp kernel function.
+#ifdef GEN_BISHENGCPP_CODE
+  os << "using namespace bisheng;\n";
+#endif
   if (emitter.shouldDeclareVariablesAtTop()) {
     // Declare all variables that hold op results including those from nested
     // regions.
@@ -1560,9 +1743,17 @@ LogicalResult CppEmitter::emitType(Location loc, Type type) {
   if (auto memrefType = dyn_cast<MemRefType>(type)) {
     // Emit memory space.
     if (memrefType.getMemorySpaceAsInt() == 1) {
+#ifdef GEN_BISHENGCPP_CODE
+      os << "__global ";
+#else
       os << "__gm__ ";
+#endif
     } else if (memrefType.getMemorySpaceAsInt() == 6) {
+#ifdef GEN_BISHENGCPP_CODE
+      os << "__local ";
+#else
       os << "__ubuf__ ";
+#endif
     } else {
       return emitError(loc, "ICT_ERROR(): cannot emit MemRef memory space: ")
              << memrefType.getMemorySpaceAsInt();
@@ -1587,14 +1778,22 @@ LogicalResult CppEmitter::emitType(Location loc, Type type) {
   if (auto llvmPtrType = dyn_cast<LLVM::LLVMPointerType>(type)) {
     Type elementType;
     if (llvmPtrType.getAddressSpace() == 1) {
+#ifdef GEN_BISHENGCPP_CODE
+      os << "__global ";
+#else
       os << "__gm__ ";
+#endif
       if (llvmPtrType.isOpaque())
         elementType = IntegerType::get(llvmPtrType.getContext(), 8,
                                        IntegerType::Unsigned);
       else
         elementType = llvmPtrType.getElementType();
     } else if (llvmPtrType.getAddressSpace() == 6) {
+#ifdef GEN_BISHENGCPP_CODE
+      os << "__local ";
+#else
       os << "__ubuf__ ";
+#endif
       if (llvmPtrType.isOpaque())
         elementType = Float32Type::get(llvmPtrType.getContext());
       else
