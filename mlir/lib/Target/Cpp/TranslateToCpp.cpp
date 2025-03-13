@@ -286,6 +286,11 @@ printBuiltinUnrealizedConversionOp(CppEmitter &emitter,
                                    UnrealizedConversionCastOp operation) {
   if (failed(emitter.emitAssignPrefix(*operation)))
     return failure();
+  raw_ostream &os = emitter.ostream();
+  os << "(";
+  if (failed(emitter.emitType(operation.getLoc(), operation.getResults()[0].getType())))
+    return failure();
+  os << ")";
   if (failed(emitter.emitOperands(*operation)))
     return failure();
   return success();
