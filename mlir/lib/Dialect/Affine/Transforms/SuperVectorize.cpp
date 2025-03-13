@@ -21,8 +21,10 @@
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Utils/VectorUtils.h"
+#include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
@@ -765,6 +767,10 @@ struct VectorizationState {
   // required.
   DenseMap<Operation *, Value> vecLoopToMask;
 
+  // if-conversion:
+  // Maps the vectorized if to the corresponding vector mask if it is required.
+  DenseMap<Operation *, Value> ifToMask;
+
   // The strategy drives which loop to vectorize by which amount.
   const VectorizationStrategy *strategy = nullptr;
 
@@ -793,6 +799,10 @@ void VectorizationState::registerOpVectorReplacement(Operation *replaced,
   LLVM_DEBUG(dbgs() << "into\n");
   LLVM_DEBUG(dbgs() << *replacement << "\n");
 
+  // if(isa<affine::AffineStoreOp>(replaced) && isa<memref::AtomicRMWOp>(replacement)) {
+  //   assert(opVectorReplacement.count(replaced) == 0 && "already registered");
+  //   opVectorReplacement[replaced] = replacement;
+  // } else {
   assert(replaced->getNumResults() == replacement->getNumResults() &&
          "Unexpected replaced and replacement results");
   assert(opVectorReplacement.count(replaced) == 0 && "already registered");
@@ -802,6 +812,7 @@ void VectorizationState::registerOpVectorReplacement(Operation *replaced,
        llvm::zip(replaced->getResults(), replacement->getResults()))
     registerValueVectorReplacementImpl(std::get<0>(resultTuple),
                                        std::get<1>(resultTuple));
+  // }
 }
 
 /// Registers the vector replacement of a scalar value. The replacement
@@ -898,7 +909,55 @@ void VectorizationState::getScalarValueReplacementsFor(
 /// Erases a loop nest, including all its nested operations.
 static void eraseLoopNest(AffineForOp forOp) {
   LLVM_DEBUG(dbgs() << "[early-vect]+++++ erasing:\n" << forOp << "\n");
+  // check forOp has no uses.
+  if(!forOp.use_empty()) {
+    llvm::errs() << "[ICT-error]: forOp still has uses\n";
+    exit(-1);
+  }
+
+  std::vector<Operation *> ops;
+  // iterate over the loop body and check for no uses.
+  for (auto &op : *forOp.getBody()) {
+    if(!op.use_empty()) {
+      llvm::errs() << "[ICT-error]: op still has uses:\n";
+      op.dump();
+      llvm::errs() << "[ICT-error]: op still has uses: end\n";
+    }
+    ops.push_back(&op);
+  }
+
+  // reverse iterate over the ops and erase them.
+  for (auto op : llvm::reverse(ops)) {
+    llvm::errs() << "[ICT-debug]: erase op:\n";
+    op->dump();
+    if(!op->use_empty()) {
+      llvm::errs() << "[ICT-error]: op still has uses\n";
+      for(auto &use : op->getUses()) {
+        llvm::errs() << "[ICT-error]: use:\n";
+        use.get().dump();
+        llvm::errs() << "[ICT-error]: use: end\n";
+      }
+    }
+    op->erase();
+    llvm::errs() << "[ICT-debug]: erase op: end\n";
+  }
+
+  llvm::errs() << "[ICT-debug]: before erase forOp:\n";
+
+  // check forOp has no uses.
+  if(!forOp.use_empty()) {
+    llvm::errs() << "[ICT-error]: forOp still has uses\n";
+    for(auto &use : forOp->getUses()) {
+      llvm::errs() << "[ICT-error]: forOp use:\n";
+      use.get().dump();
+      llvm::errs() << "[ICT-error]: forOp use: end\n";
+    }
+  }
+  forOp.dump();
+  llvm::errs() << "[ICT-debug]: forOp.dump(): end\n";
   forOp.erase();
+
+  llvm::errs() << "[ICT-debug]: after erase forOp:\n";
 }
 
 /// Erases the scalar loop nest after its successful vectorization.
@@ -1164,6 +1223,95 @@ static Value vectorizeOperand(Value operand, VectorizationState &state) {
   return nullptr;
 }
 
+// 例: 在gemv中, 要向量化的循环是外层循环, 其归纳变量是%arg3;
+// 内层循环的归纳变量是%arg4, %arg4 = affine_map<(d0) -> ((d0 floordiv 32) *
+// 32)>(%arg3) to affine_map<(d0) -> ((d0 floordiv 32) * 32 + 32)>(%arg3) 
+// loadOp1: %4 = affine.load %arg0[%arg4] : memref<?xf32>
+//    1. 首先计算 %arg3 对 %arg4 的影响, 即: %arg4 和 %arg3的关系(accessPattern)
+//    2. 然后根据 %arg4 和 loadOp's map的关系, 传导计算 %arg3 对 loadOp1的影响
+// loadOp2: %5 = affine.load %arg2[%arg4 * 256 + %arg3 + symbol(%0) * 32 - (%arg3 floordiv 32) * 32 - (symbol(%0) floordiv 8) * 256] : memref<?xf32>
+//    1. loadOp 的 mapOperand 有 2 个dim, 分别是 %arg4 和 %arg3;
+//    2. 首先计算 %arg3 通过 %arg4, 对 loadOp2的影响: 
+//      2.1. 首先计算 %arg3 对 %arg4 的影响, 即: %arg4 和 %arg3的关系(accessPattern)
+//      2.2. 然后根据 %arg4 和 loadOp's map的关系, 传导计算 %arg3 通过 %arg4 对 loadOp2的影响
+//    3. 然后计算 %arg3 通过 %arg3, 对 loadOp2的影响
+//      3.1  首先计算 %arg3 对 %arg3 的影响, 即: %arg3 和 %arg3的关系(accessPattern)
+//      3.2  然后根据 %arg3 和 loadOp's map的关系, 传导计算 %arg3 通过 %arg3 对 loadOp2的影响
+//    4. 最后合并 2 和 3 的结果
+
+static void isMapOperandLinearWithVectorDim(const AffineExpr &expr,
+                                            Value mapOperand,
+                                            int mapOperandPosition,
+                                            BlockArgument vecIv,
+                                            AccessPattern &accessPattern) {
+  // The name of the following function should be:
+  // relationOfVectorIvWithMapOperand(vecIv, mapOperand, accessPattern);
+  isLinearWithIndex(vecIv, mapOperand, accessPattern);
+  // if accessPattern.containSymbol, containOtherDim == true, we should clear
+  // it, 以防影响后续relationOfMapOperandWithMemoryOp() 对 containSymbol 和
+  // containOtherDim 的计算和判定, 因为这是两层的关系, 两层之间的containSymbol
+  // containOtherDim 都应该是独立的, 没有关系的, 至少在现在来看是这样. 当然,
+  // 在现在的gemv case下, 还没有出现这样的情况.
+  if (accessPattern.containSymbol) {
+    llvm::errs() << "SuperVectorize.cpp::isMapOperandLinearWithVectorDim(): "
+                    "accessPattern.containSymbol == true, clear it.\n";
+    accessPattern.containSymbol = false;
+  }
+  if (accessPattern.containOtherDim) {
+    llvm::errs() << "SuperVectorize.cpp::isMapOperandLinearWithVectorDim(): "
+                    "accessPattern.containOtherDim == true, clear it.\n";
+    accessPattern.containOtherDim = false;
+  }
+  if (!accessPattern.containNeededDim) {
+    // 如果loopIv和要向量化的Iv无关, 当前的逻辑应该是能处理得了这种情况的,
+    // 只是为了保险一些, 希望如果出现这种情况, 我们能及时发现,
+    // 确认一下逻辑是否正确, 所以在这里选择打印信息 and exit(-1).
+    llvm::errs() << "SuperVectorize.cpp::isMapOperandLinearWithVectorDim(): "
+                    "accessPattern.containNeededDim != true, check it. "
+                    "Although we could process this situation.\n";
+    exit(-1);
+  }
+  // the `accessPattern` is passed twice: 1st is as the InitAccessPattern of the
+  // %arg4, it's const &; 2nd is as the returned value, it will be change inside
+  // the function. And we know that, the 2nd `accessPattern` will be updated in
+  // the last of the function, because it's post-order traversal. So it must be:
+  // 1st `accessPattern` is used, and after then, in last of the function call,
+  // the 2nd `accessPattern` is updated.
+  relationOfMapOperandWithMemoryOp(expr, mapOperandPosition,
+                                   accessPattern, accessPattern);
+}
+
+// In theory, synthesis of accessPatterns == `Add` of accessPatterns.
+static void
+synthesizeAccessPatterns(const SmallVector<AccessPattern, 8> &accessPatterns,
+                         AccessPattern &wholeAccessPattern) {
+  for (unsigned i = 0; i < accessPatterns.size(); i++) {
+    if (i == 0) {
+      wholeAccessPattern = accessPatterns[i];
+    } else {
+      addAccessPatterns(wholeAccessPattern, wholeAccessPattern,
+                        accessPatterns[i]);
+    }
+  }
+}
+
+// `mapOperands`: the map operands of loadOp.
+// Relation between loadOp's map expr and the vectorizeDim.
+static void isMapOperandsLinearWithVectorDim(
+    const AffineExpr &expr, const SmallVector<Value, 8> &mapOperands,
+    BlockArgument vecIv, AccessPattern &wholeAccessPattern) {
+  SmallVector<AccessPattern, 8> accessPatterns;
+  int i = 0;
+  for (auto mapOperand : mapOperands) {
+    AccessPattern accessPattern;
+    isMapOperandLinearWithVectorDim(expr, mapOperand, i, vecIv, accessPattern);
+    accessPatterns.push_back(accessPattern);
+    i++;
+  }
+  synthesizeAccessPatterns(accessPatterns, wholeAccessPattern);
+  return;
+}
+
 /// Vectorizes an affine load with the vectorization strategy in 'state' by
 /// generating a 'vector.transfer_read' op with the proper permutation map
 /// inferred from the indices of the load. The new 'vector.transfer_read' is
@@ -1180,15 +1328,79 @@ static Operation *vectorizeAffineLoad(AffineLoadOp loadOp,
   SmallVector<Value, 8> mapOperands;
   state.getScalarValueReplacementsFor(loadOp.getMapOperands(), mapOperands);
 
+  // get the vectorized iv:
+  if (state.strategy->loopToVectorDim.size() != 1) {
+    // Here we assume that there is only one vectorized loop for current
+    // `rootLoop`.
+    llvm::errs() << "SuperVectorize.cpp::vectorizeAffineLoad(): "
+                    "state.strategy.loopToVectorDim.size() != 1\n";
+    exit(-1);
+  }
+  Operation *vecLoop = state.strategy->loopToVectorDim.begin()->first;
+  AffineForOp vecForOp = llvm::dyn_cast<AffineForOp>(vecLoop);
+  if (!vecForOp) {
+    llvm::errs() << "SuperVectorize.cpp::vectorizeAffineLoad(): !vecForOp\n";
+    exit(-1);
+  }
+  BlockArgument vecIv = vecForOp.getInductionVar();
+
+  AccessPattern wholeAccessPattern;
+  if (loadOp.getMap().getNumResults() != 1) {
+    // Here we assume that the map of loadOp has only one result.
+    llvm::errs() << "SuperVectorize.cpp::vectorizeAffineLoad(): "
+                    "loadOp.getMap().getNumResults() != 1, check it!\n";
+    exit(-1);
+  }
+  auto expr = loadOp.getMap().getResult(0);
+  isMapOperandsLinearWithVectorDim(expr, loadOp.getMapOperands(), vecIv,
+                                   wholeAccessPattern);
+
+  if (state.strategy->vectorSizes[0] > wholeAccessPattern.stepLength) {
+    // if state.strategy->vectorSizes > wholeAccessPattern.stepLength, the
+    // situation may be much more complex, we should check it.
+    llvm::errs() << "SuperVectorize.cpp::vectorizeAffineLoad(): "
+                    "state.strategy->vectorSizes > "
+                    "wholeAccessPattern.stepLength, check it!\n";
+    exit(-1);
+  }
+
+  bool loadScalarAndBroadcast = false;
+  if (!wholeAccessPattern.containNeededDim) {
+    // 该affine.load的mapOperand和vectorizeDim无关, 采取load标量,
+    // 再broadCast的方式
+    loadScalarAndBroadcast = true;
+  } else {
+    if (wholeAccessPattern.a == 0) {
+      if (wholeAccessPattern.stepLength == 0) {
+        // 不可能containNeededDim, 这俩还同时为0, 这种到底是啥case, check it.
+        llvm::errs() << "SuperVectorize.cpp::vectorizeAffineLoad(): "
+                        "wholeAccessPattern.containNeededDim == true, but "
+                        "wholeAccessPattern.a == 0 && "
+                        "wholeAccessPattern.stepLength == 0, check it!\n";
+        exit(-1);
+      } else {
+        // 该affine.load的mapOperand和vectorizeDim有关, 但是a == 0 &&
+        // wholeAccessPattern.stepLength != 0, 采取load + broadcast的方式
+        loadScalarAndBroadcast = true;
+      }
+    }
+  }
+
   // Compute indices for the transfer op. AffineApplyOp's may be generated.
   SmallVector<Value, 8> indices;
   indices.reserve(memRefType.getRank());
   if (loadOp.getAffineMap() !=
-      state.builder.getMultiDimIdentityMap(memRefType.getRank()))
+      state.builder.getMultiDimIdentityMap(memRefType.getRank())) {
+    llvm::errs() << "SuperVectorize.cpp::vectorizeAffineLoad(): before "
+                    "computeMemoryOpIndices()\n";
     computeMemoryOpIndices(loadOp, loadOp.getAffineMap(), mapOperands, state,
                            indices);
-  else
+  }
+  else {
+    llvm::errs() << "SuperVectorize.cpp::vectorizeAffineLoad(): before append()\n";
     indices.append(mapOperands.begin(), mapOperands.end());
+  }
+
 
   // Compute permutation map using the information of new vector loops.
   auto permutationMap = makePermutationMap(state.builder.getInsertionBlock(),
@@ -1200,12 +1412,21 @@ static Operation *vectorizeAffineLoad(AffineLoadOp loadOp,
   LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ permutationMap: ");
   LLVM_DEBUG(permutationMap.print(dbgs()));
 
+  if(loadScalarAndBroadcast) {
+    auto newAffineLoad = state.builder.create<AffineLoadOp>(
+        loadOp.getLoc(), loadOp.getMemRef(), indices);
+    auto broadcastOp = state.builder.create<BroadcastOp>(
+        loadOp.getLoc(), vectorType, newAffineLoad.getResult());
+    state.registerOpVectorReplacement(loadOp, broadcastOp);
+    return broadcastOp;
+  } else {
   auto transfer = state.builder.create<vector::TransferReadOp>(
       loadOp.getLoc(), vectorType, loadOp.getMemRef(), indices, permutationMap);
 
   // Register replacement for future uses in the scope.
   state.registerOpVectorReplacement(loadOp, transfer);
   return transfer;
+  }
 }
 
 /// Vectorizes an affine store with the vectorization strategy in 'state' by
@@ -1216,6 +1437,10 @@ static Operation *vectorizeAffineLoad(AffineLoadOp loadOp,
 /// otherwise.
 static Operation *vectorizeAffineStore(AffineStoreOp storeOp,
                                        VectorizationState &state) {
+  if(state.opVectorReplacement.count(storeOp) != 0) {
+    LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ storeOp already registered/processed\n");
+    return state.opVectorReplacement[storeOp];
+  }
   MemRefType memRefType = storeOp.getMemRefType();
   Value vectorValue = vectorizeOperand(storeOp.getValueToStore(), state);
   if (!vectorValue)
@@ -1243,10 +1468,139 @@ static Operation *vectorizeAffineStore(AffineStoreOp storeOp,
   LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ permutationMap: ");
   LLVM_DEBUG(permutationMap.print(dbgs()));
 
+  // Operation *newStoreOp = nullptr;
+  // if(storeOp->hasAttr("atomic_addf")) {
+  //   // transfer->setAttr("atomic_addf", storeOp->getAttr("atomic_addf"));
+  //   // for atomic, now convert it to memref.atomic_rmw
+  //   newStoreOp = state.builder.create<memref::AtomicRMWOp>(
+  //       storeOp.getLoc(), arith::AtomicRMWKind::addf, vectorValue, storeOp.getMemRef(), indices);
+    
+  // } else {
+  //   // for non-atomic, use originally processed vector.transfer_write
+  //   newStoreOp = state.builder.create<vector::TransferWriteOp>(
+  //     storeOp.getLoc(), vectorValue, storeOp.getMemRef(), indices,
+  //     permutationMap);
+  // }
+
   auto transfer = state.builder.create<vector::TransferWriteOp>(
       storeOp.getLoc(), vectorValue, storeOp.getMemRef(), indices,
       permutationMap);
-  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ vectorized store: " << transfer);
+  if(storeOp->hasAttr("atomic_addf")) {
+    // Here, for atomic case, we should have converted affine.store to
+    // memref.atomic_rmw, but memref.atomic_rmw only supports scalar value, so
+    // we choose to use vector.transfer_write with atomic_addf attribute.
+    transfer->setAttr("atomic_addf", storeOp->getAttr("atomic_addf"));
+  }
+  
+  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ vectorized store: " << *transfer);
+
+  // Register replacement for future uses in the scope.
+  state.registerOpVectorReplacement(storeOp, transfer);
+  return transfer;
+}
+
+// /// This function is copied from the above vectorizeAffineStore(), add my int mask 
+// /// support.
+// /// Vectorizes an affine store with the vectorization strategy in 'state' by
+// /// generating a 'vector.transfer_write' op with the proper permutation map
+// /// inferred from the indices of the store. The new 'vector.transfer_store' is
+// /// registered as replacement of the scalar load. Returns the newly created
+// /// 'vector.transfer_write' if vectorization was successful. Returns nullptr,
+// /// otherwise.
+// static Operation *vectorizeAffineStoreWithIntMask(AffineStoreOp storeOp,
+//                                        VectorizationState &state, Value mask) {
+//   if(state.opVectorReplacement.count(storeOp) != 0) {
+//     LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ storeOp already registered/processed\n");
+//     return state.opVectorReplacement[storeOp];
+//   }
+//   MemRefType memRefType = storeOp.getMemRefType();
+//   Value vectorValue = vectorizeOperand(storeOp.getValueToStore(), state);
+//   if (!vectorValue)
+//     return nullptr;
+
+//   // Replace map operands with operands from the vector loop nest.
+//   SmallVector<Value, 8> mapOperands;
+//   state.getScalarValueReplacementsFor(storeOp.getMapOperands(), mapOperands);
+
+//   // Compute indices for the transfer op. AffineApplyOp's may be generated.
+//   SmallVector<Value, 8> indices;
+//   indices.reserve(memRefType.getRank());
+//   if (storeOp.getAffineMap() !=
+//       state.builder.getMultiDimIdentityMap(memRefType.getRank()))
+//     computeMemoryOpIndices(storeOp, storeOp.getAffineMap(), mapOperands, state,
+//                            indices);
+//   else
+//     indices.append(mapOperands.begin(), mapOperands.end());
+
+//   // Compute permutation map using the information of new vector loops.
+//   auto permutationMap = makePermutationMap(state.builder.getInsertionBlock(),
+//                                            indices, state.vecLoopToVecDim);
+//   if (!permutationMap)
+//     return nullptr;
+//   LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ permutationMap: ");
+//   LLVM_DEBUG(permutationMap.print(dbgs()));
+
+//   auto transfer = state.builder.create<vector::TransferWriteVarLengthOp>(
+//       storeOp.getLoc(), vectorValue, storeOp.getMemRef(), indices, mask,
+//       permutationMap);
+//   if(storeOp->hasAttr("atomic_addf")) {
+//     transfer->setAttr("atomic_addf", storeOp->getAttr("atomic_addf"));
+//   }
+//   LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ vectorized store: " << transfer);
+
+//   // Register replacement for future uses in the scope.
+//   state.registerOpVectorReplacement(storeOp, transfer);
+//   return transfer;
+// }
+
+
+/// This function is copied from the above vectorizeAffineStore(), add mask 
+/// support.
+/// Vectorizes an affine store with the vectorization strategy in 'state' by
+/// generating a 'vector.transfer_write' op with the proper permutation map
+/// inferred from the indices of the store. The new 'vector.transfer_store' is
+/// registered as replacement of the scalar load. Returns the newly created
+/// 'vector.transfer_write' if vectorization was successful. Returns nullptr,
+/// otherwise.
+static Operation *vectorizeAffineStoreWithMask(AffineStoreOp storeOp,
+                                       VectorizationState &state, Value mask) {
+  if(state.opVectorReplacement.count(storeOp) != 0) {
+    LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ storeOp already registered/processed\n");
+    return state.opVectorReplacement[storeOp];
+  }
+  MemRefType memRefType = storeOp.getMemRefType();
+  Value vectorValue = vectorizeOperand(storeOp.getValueToStore(), state);
+  if (!vectorValue)
+    return nullptr;
+
+  // Replace map operands with operands from the vector loop nest.
+  SmallVector<Value, 8> mapOperands;
+  state.getScalarValueReplacementsFor(storeOp.getMapOperands(), mapOperands);
+
+  // Compute indices for the transfer op. AffineApplyOp's may be generated.
+  SmallVector<Value, 8> indices;
+  indices.reserve(memRefType.getRank());
+  if (storeOp.getAffineMap() !=
+      state.builder.getMultiDimIdentityMap(memRefType.getRank()))
+    computeMemoryOpIndices(storeOp, storeOp.getAffineMap(), mapOperands, state,
+                           indices);
+  else
+    indices.append(mapOperands.begin(), mapOperands.end());
+
+  // Compute permutation map using the information of new vector loops.
+  auto permutationMap = makePermutationMap(state.builder.getInsertionBlock(),
+                                           indices, state.vecLoopToVecDim);
+  if (!permutationMap)
+    return nullptr;
+  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ permutationMap: ");
+  LLVM_DEBUG(permutationMap.print(dbgs()));
+
+  Type resultType = llvm::dyn_cast<RankedTensorType>(storeOp.getMemRef().getType());
+
+  auto transfer = state.builder.create<vector::TransferWriteOp>(
+      storeOp.getLoc(), resultType, vectorValue, storeOp.getMemRef(), indices,
+      permutationMap, mask, ArrayAttr());
+  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ masked vectorized store: " << transfer);
 
   // Register replacement for future uses in the scope.
   state.registerOpVectorReplacement(storeOp, transfer);
@@ -1327,9 +1681,30 @@ static Operation *vectorizeAffineForOp(AffineForOp forOp,
     }
   }
 
+  // 这应该算是对原来代码的一个debug, 一个改进吧; 但注意下面的todo
+  // Note: the original vecForOp create, use olfForOp's lower/upper bound, do
+  // not meet the requirement of my case vectorization:
+  //   for(int i = 0; i < 512; i++) {   // This loop need to be vectorized
+  //     for(int j = i; j < 512; j++) { // This loop do not vectorize.
+  //       ...
+  //     }
+  //   }
+  // As above, the such case is: nested 2nd loop's lower/upper bound use the 1st
+  // loop's induction variable. The original logic can not process the 2nd loop,
+  // so I need to change it.
+  // get forOp's lower/upper bound's state.valueScalarReplacement.lookupOrDefault() value.
+  SmallVector<Value, 8> newLowerBounds;
+  SmallVector<Value, 8> newUpperBounds;
+  state.getScalarValueReplacementsFor(forOp.getLowerBoundOperands(), newLowerBounds);
+  state.getScalarValueReplacementsFor(forOp.getUpperBoundOperands(), newUpperBounds);
+
+  // TODO: 采用old还是new lower/upper bound, 和isLoopVecDim有关吗?
+  // 比如在这个例子中, 如果是要向量化的1st loop, 还需要这样查一下吗?
+  // 这样查一下的结果还对吗?
+
   auto vecForOp = state.builder.create<AffineForOp>(
-      forOp.getLoc(), forOp.getLowerBoundOperands(), forOp.getLowerBoundMap(),
-      forOp.getUpperBoundOperands(), forOp.getUpperBoundMap(), newStep,
+      forOp.getLoc(), newLowerBounds, forOp.getLowerBoundMap(),
+      newUpperBounds, forOp.getUpperBoundMap(), newStep,
       vecIterOperands,
       /*bodyBuilder=*/[](OpBuilder &, Location, Value, ValueRange) {
         // Make sure we don't create a default terminator in the loop body as
@@ -1423,12 +1798,328 @@ static Operation *widenOp(Operation *op, VectorizationState &state) {
   return vecOp;
 }
 
+static int getVectorSize(VectorizationState &state) {
+  if(state.strategy->vectorSizes.size() != 1) {
+    llvm::errs() << "vectorSizes is not 1-D, please check the vectorization strategy\n";
+    exit(-1);
+  }
+  if(state.strategy->vectorSizes[0] == 0) {
+    llvm::errs() << "vectorSizes is 0, please check the vectorization strategy\n";
+    exit(-1);
+  }
+  return state.strategy->vectorSizes[0];
+}
+
+/// Vectorizes an index_cast operation by create vector.broadcast +
+/// arith.constant(vector) + arith.addi after it, and replace the index_cast
+/// with the arith.addi.(or add a map of index_cast to arith.addi in the state).
+/// add this function is for such case:
+///   for(int i = 0; i < 512; i++) {
+///     %idx = arith.index_cast %i : index to i32
+///     A[i] = B[i] + %idx;
+///   }
+static Operation *vectorizeArithIndexCastOp(arith::IndexCastOp indexCastOp,
+                                            VectorizationState &state) {
+  // When arrive here, the operand can not be vectorized, such as a block
+  // argument, or index of a forOp.
+  Value oldIn = indexCastOp.getIn();
+  Value result = indexCastOp.getOut();
+
+  Value newIn = state.valueScalarReplacement.lookupOrDefault(oldIn);
+  // check newIn
+  if(!newIn) {
+    llvm::errs() << "[ICT-error]: newIn is nullptr\n";
+    exit(-1);
+  }
+
+  // generate a clone of the index_cast op: insert it to the new loop.
+  auto newIndexCastOp = state.builder.create<arith::IndexCastOp>(
+      indexCastOp.getLoc(), result.getType(), newIn);
+  Value newIndexCastResult = newIndexCastOp.getOut();
+
+  // generate a broadcast op for the newIndexCastResult.
+  auto vectorTy = getVectorType(newIndexCastResult.getType(), state.strategy);
+  auto broadcastOp = state.builder.create<vector::BroadcastOp>(
+      newIndexCastResult.getLoc(), vectorTy, newIndexCastResult);
+  
+  // generate a constant vector <0, 1, 2, 3, ...>, size is the same as the vectorTy.
+  int vectorSize = getVectorSize(state);
+  std::vector<int> constantValues;
+  for(int i = 0; i < vectorSize; i++) {
+    constantValues.push_back(i);
+  }
+  auto constantAttr = DenseElementsAttr::get(vectorTy, ArrayRef<int>(constantValues));
+  auto constantOp = state.builder.create<arith::ConstantOp>(
+      newIndexCastResult.getLoc(), constantAttr);
+  
+  // generate a arith.addi op for the broadcast and the constant.
+  auto addiOp = state.builder.create<arith::AddIOp>(
+      newIndexCastResult.getLoc(), broadcastOp, constantOp);
+
+  state.registerValueVectorReplacement(result, addiOp);
+  return addiOp;
+}
+
+// // The number of affineIfOp that have been if-converted. Every affineIfOp will
+// // map to a number according to it. This number will be added as an attribute to
+// // the op that generate mask, and the op that use the mask. i.e. this number is
+// // used to associating the ops that generate and use masks.
+// static unsigned int conversionedIfNum = 0;
+
+// /// generate:
+// ///   affine.apply
+// ///   x = index_cast(x);
+// ///   x = arith.min(x, dim)
+// ///   x = arith.max(x, 0)
+
+/// original:
+///   affine.for %arg3 = 0 to 256     // thread id wrapped loop
+///     affine.if(%arg3 / 32 == 0) {
+///       ...
+///     }
+///   }
+
+/// generate:
+///   %cst = arith.constant dense<[0, 1, 2, 3, 4, 5, 6, 7]> : vector<8xi32>
+///   affine.for(%arg3 = 0 to 256, step: 8){   // 8 for vector factor is just an example.
+///     x = vector.broadcast() %arg3 -> vector<8xindex>
+///     x1 = arith.addi(x, %cst)
+///     y_32 = vector.broadcast() 32 -> vector<8xi32>
+///     z = arith.div x1, y_32
+///     cst_32_0 = vector.broadcast() 0 -> vector<8xi32>
+///     mask = arith.cmp eq z, cst_32_0
+///     ...
+///   }
+
+static Value createMaskForIfOp(AffineIfOp affineIfOp, VectorizationState &state) {
+  // Check if we have already created the mask.
+  if(Value mask = state.ifToMask.lookup(affineIfOp)) {
+    return mask;
+  }
+  // Currently the insert point should already be inside the affineForOp, so we can
+  // directly insert instructions.
+  // generate affine.apply and vector.create_mask.
+  // get affineIfOp's integerSet, and get the mask from the integerSet.
+  auto intSet = affineIfOp.getIntegerSet();
+  if(intSet.getNumInputs() != 1) {
+    llvm::errs() << "createMaskForIfOp(): integerSet's input number is not "
+                    "1, now can not process!\n";
+    exit(-1);
+  }
+  if(intSet.getNumConstraints() != 1) {
+    llvm::errs() << "createMaskForIfOp(): integerSet's constraint number is "
+                    "not 1, now can not process!\n";
+    exit(-1);
+  }
+  if(!intSet.isEq(0)) {
+    llvm::errs() << "createMaskForIfOp(): the only constraint in integerSet "
+                    "is not equality, now can not process!\n";
+    exit(-1);
+  }
+  auto constraint = intSet.getConstraint(0);  // In current case, is: d0 floordiv 32 == 0
+  auto binExprOp = constraint.dyn_cast<AffineBinaryOpExpr>();
+  if(!binExprOp) {
+    llvm::errs() << "createMaskForIfOp(): the only constraint in integerSet "
+                    "is not binary op, now can not process!\n";
+    exit(-1);
+  }
+  if(binExprOp.getKind() != AffineExprKind::FloorDiv) {
+    llvm::errs() << "createMaskForIfOp(): the only constraint in integerSet "
+                    "is not floordiv, now can not process!\n";
+    exit(-1);
+  }
+  // Here, we can make sure that the only constraint is: d0 floordiv xx == 0
+  auto lhs = binExprOp.getLHS();    // d0
+  auto rhs = binExprOp.getRHS();    // xx
+  if(!lhs.isa<AffineDimExpr>()) {
+    llvm::errs() << "createMaskForIfOp(): the only constraint in integerSet "
+                    "is not floordiv of dim, now can not process!\n";
+    exit(-1);
+  }
+  auto rhsConstExpr = rhs.dyn_cast<AffineConstantExpr>();
+  if(!rhsConstExpr) {
+    llvm::errs() << "createMaskForIfOp(): the rhs is not a constant, now can "
+                    "not process!\n";
+    exit(-1);
+  }
+
+  // 通过上面的if判断, 可以确定lhs是affineDim, 也即loop的循环迭代量,
+  // 所以直接对affineIf operand对应的newOperand进行broadcast 
+  SmallVector<Value, 1> newOperands;
+  state.getScalarValueReplacementsFor(affineIfOp.getOperands(), newOperands);
+  Value newOperand = newOperands[0];
+  // generate arith.index_cast: index -> i32
+  auto newI32Operand = state.builder.create<arith::IndexCastOp>(
+      affineIfOp.getLoc(), state.builder.getIntegerType(32), newOperand);
+
+  // generate vector.broadacast
+  auto broadcastOp = state.builder.create<vector::BroadcastOp>(
+      affineIfOp.getLoc(), 
+      VectorType::get(state.strategy->vectorSizes, newI32Operand.getType()), newI32Operand);
+  
+  // generate arith.constant
+  int vectorSize = getVectorSize(state);
+  DenseIntElementsAttr constantAttr = state.builder.getI32VectorAttr(
+        llvm::to_vector<8>(llvm::seq<int32_t>(0, vectorSize)));
+  Value constIndicesVec = state.builder.create<arith::ConstantOp>(affineIfOp.getLoc(), constantAttr);
+
+  // generate arith.addi
+  auto addiOp = state.builder.create<arith::AddIOp>(
+      affineIfOp.getLoc(), broadcastOp, constIndicesVec);
+  
+  // generate vector.broadcast: rhs -> vector<8xrhs>
+  int rhsInt = rhsConstExpr.getValue();
+  // convert rhsInt to Value.
+  auto rhsIntAttr = mlir::IntegerAttr::get(state.builder.getIntegerType(32), rhsInt);
+  auto rhsIntValue = state.builder.create<arith::ConstantOp>(
+      affineIfOp.getLoc(), state.builder.getIntegerType(32), rhsIntAttr);
+
+  auto rhsVec = state.builder.create<vector::BroadcastOp>(
+      affineIfOp.getLoc(), 
+      VectorType::get(state.strategy->vectorSizes, state.builder.getIntegerType(32)), rhsIntValue);
+  
+  // generate arith.div
+  auto divOp = state.builder.create<arith::DivSIOp>(
+      affineIfOp.getLoc(), addiOp, rhsVec);
+  
+  // generate arith.constant for [0, 0, 0, 0, 0, 0, 0, 0]
+  SmallVector<int32_t, 8> zeroValues;
+  for(int i = 0; i < vectorSize; i++) {
+    zeroValues.push_back(0);
+  }
+  auto zeroAttr = DenseIntElementsAttr::get(
+      VectorType::get(state.strategy->vectorSizes, state.builder.getIntegerType(32)),
+      ArrayRef<int32_t>(zeroValues));
+  auto constZeroOp = state.builder.create<arith::ConstantOp>(affineIfOp.getLoc(), zeroAttr);
+
+  // generate arith.cmp eq
+  auto cmpOp = state.builder.create<arith::CmpIOp>(
+      affineIfOp.getLoc(), arith::CmpIPredicate::eq, divOp, constZeroOp);
+  
+  // return cmpOp as mask. (at the last of this function.)
+
+  
+
+  // // make a map using the lhs and rhs.
+  // // Create an affinemap: (d0) -> (xx - d0)
+  // auto map = AffineMap::get(1, 0, {rhs - lhs});
+  // // Create a new affine.apply op.
+  // // TODO: Note: 这里affine.apply的operand, 很可能有问题, 后面可能会有问题, 应该用vectorize后的loop的arg3
+  // SmallVector<Value, 1> newOperands;
+  // state.getScalarValueReplacementsFor(affineIfOp.getOperands(), newOperands);
+  // auto affineApplyOp = state.builder.create<AffineApplyOp>(
+  //     affineIfOp.getLoc(), map, newOperands);
+
+  // // // create a index_cast op: cast affineApplyOp from index to i32.
+  // // auto indexCastedMask = state.builder.create<arith::IndexCastOp>(
+  // //     affineIfOp.getLoc(), state.builder.getIntegerType(32), affineApplyOp);
+  
+  // // // create a arith.min op: min(indexCastedMask, dim)
+  // // if(state.strategy->vectorSizes.size() != 1) {
+  // //   llvm::errs() << "vectorSizes is not 1-D, please check the vectorization strategy\n";
+  // //   exit(-1);
+  // // }
+  // // // convert state.strategy->vectorSizes[0] to value with type of indexCastedMask.
+  // // auto dimIntegerAttr = mlir::IntegerAttr::get(state.builder.getIntegerType(32), state.strategy->vectorSizes[0]);
+  // // auto dimOp = state.builder.create<arith::ConstantOp>(
+  // //     affineIfOp.getLoc(), state.builder.getIntegerType(32), dimIntegerAttr);
+  // // auto minMask = state.builder.create<arith::MinSIOp>(
+  // //     affineIfOp.getLoc(), indexCastedMask, dimOp);
+  
+  // // // create a arith.max op: max(minMask, 0)
+  // // auto zeroIntegetAttr = mlir::IntegerAttr::get(state.builder.getIntegerType(32), 0);
+  // // auto zeroOp = state.builder.create<arith::ConstantOp>(
+  // //     affineIfOp.getLoc(), state.builder.getIntegerType(32), zeroIntegetAttr);
+  // // auto maxMask = state.builder.create<arith::MaxSIOp>(
+  // //     affineIfOp.getLoc(), minMask, zeroOp);
+  
+  // // // 给用到这个mask的指令, 设置一个和这个mask关联的唯一的attribute标识符；这个mask也设置一个, 以此来把这个mask和用到它的op关联起来；
+  // // // Add it, then use it.
+  // // conversionedIfNum++;
+  // // maxMask->setAttr("maskNum", state.builder.getI32IntegerAttr(conversionedIfNum));
+  // // // the "generate_mask_op" attribute marks the op that generate the mask.
+  // // maxMask->setAttr("generate_mask_op", state.builder.getUnitAttr());
+
+  // // Create a new vector.create_mask op.
+  // auto maskTy = VectorType::get(state.strategy->vectorSizes,
+  //                               state.builder.getIntegerType(1));
+  // auto mask = state.builder.create<vector::CreateMaskOp>(
+  //     affineIfOp.getLoc(), maskTy, Value(affineApplyOp));
+  
+  // LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ create mask for affineIfOp: " << maxMask);
+  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ create mask for affineIfOp: " << cmpOp);
+  state.ifToMask[affineIfOp] = cmpOp;
+  return cmpOp;
+}
+
+/// Here is: if-conversion
+/// Vectorizes an affine if operation by creating mask, and add this mask to
+/// instructions inside the ifOp. For instructions which support mask
+/// originally, like vector.transfer_read/write, we can directly add the mask to
+/// the instruction. For other instructions, we temporarily add the mask to the
+/// instruction's metadata, for next steps' lowering to NPU dialect.
+static Operation *vectorizeAffineIfOp(AffineIfOp affineIfOp,
+                                      VectorizationState &state) {
+  Value mask = createMaskForIfOp(affineIfOp, state);
+  // Add the mask to the instructions inside the affineIfOp.
+  llvm::errs() << "vectorizeAffineIfOp(): after generate mask!\n";
+
+  Operation *vecOp = nullptr;
+  // Add the mask to the instructions inside the affineIfOp.
+  affineIfOp->walk([&](Operation *op) {
+    Operation *newOp = nullptr;
+    if(auto affineStoreOp = dyn_cast<AffineStoreOp>(op)) {
+      // newOp = vectorizeAffineStore(affineStoreOp, state);
+      newOp = vectorizeAffineStoreWithMask(affineStoreOp, state, mask);
+      // get i32 attribute from mask, and set it to the newOp.
+      // newOp->setAttr("mask", mask);
+      // newOp->setAttr("maskNum", state.builder.getI32IntegerAttr(conversionedIfNum));
+    } else if(auto affineYieldOp = dyn_cast<AffineYieldOp>(op)) {
+      // do nothing.
+      // Because we will delete the original affineIfOp, i.e. there is no this
+      // affine.if level, so not need to process the affineYieldOp.
+      // The reason why return affineYieldOp is same as the following if-case.
+      // Register replacement for future uses in the scope.
+      // 这里添加到opVectorReplacement中, 是为了后面walk到该yield的时候,
+      // 判断已经处理过这个op, 不需要再处理了
+      state.registerOpVectorReplacement(affineYieldOp, affineYieldOp);
+      newOp = affineYieldOp;
+    } else if(auto walkAffineIfOp = dyn_cast<AffineIfOp>(op)) {
+      if(walkAffineIfOp == affineIfOp) {
+        // do nothing
+        llvm::errs() << "vectorizeAffineIfOp(): the op is affineIfOp itself, do nothing!\n";
+        // The returned "newOp" is just for judge the vectorization is
+        // successful or not, would not be used, it just need not be nullptr, so
+        // here set it to walkAffineIfOp.
+        newOp = walkAffineIfOp;
+      } else {
+        // nested if, now has not meet such case.
+        llvm::errs() << "vectorizeAffineIfOp(): the op is nested affineIfOp, now can not process!\n";  
+        exit(-1);
+      }
+    }
+    else {
+      llvm::errs() << "vectorizeAffineIfOp(): the op inside affineIfOp is not "
+                      "affineStoreOp, need add process logic!\n";
+      op->dump();
+      exit(-1);
+    }
+    vecOp = newOp;
+  });
+
+  return vecOp;
+}
+
 /// Vectorizes a yield operation by widening its types. The builder's insertion
 /// point is set after the vectorized parent op to continue vectorizing the
 /// operations after the parent op. When vectorizing a reduction loop a mask may
 /// be used to prevent adding garbage values to the accumulator.
 static Operation *vectorizeAffineYieldOp(AffineYieldOp yieldOp,
                                          VectorizationState &state) {
+  if(state.opVectorReplacement.count(yieldOp) != 0) {
+    LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ yieldOp already registered/processed\n");
+    return state.opVectorReplacement[yieldOp];
+  }
   Operation *newYieldOp = widenOp(yieldOp, state);
   Operation *newParentOp = state.builder.getInsertionBlock()->getParentOp();
 
@@ -1462,6 +2153,8 @@ static Operation *vectorizeAffineYieldOp(AffineYieldOp yieldOp,
     }
   }
 
+  // Because here it process only affineFor's yieldOp, so it need set insertion
+  // point to after the "newParentOp". For affineIfOp, it need not.
   state.builder.setInsertionPointAfter(newParentOp);
   return newYieldOp;
 }
@@ -1493,6 +2186,20 @@ static Operation *vectorizeOneOperation(Operation *op,
     return vectorizeAffineYieldOp(yieldOp, state);
   if (auto constant = dyn_cast<arith::ConstantOp>(op))
     return vectorizeConstant(constant, state);
+  if (auto indexCast = dyn_cast<arith::IndexCastOp>(op)) {
+    // Keep the original processing logic as much as possible: only use the new
+    // processing logic when the original widenOp() cannot handle it.
+    Operation *newOp = widenOp(indexCast, state);
+    if(newOp)
+      return newOp;
+    else 
+      return vectorizeArithIndexCastOp(indexCast, state);
+  }
+  if(auto affineIfOp = dyn_cast<AffineIfOp>(op)) {
+    // Originally the affineIfOp is not vectorizable, enter the following code:
+    // `op->getNumRegions() != 0` case and return nullptr.
+    return vectorizeAffineIfOp(affineIfOp, state);
+  }
 
   // Other ops with regions are not supported.
   if (op->getNumRegions() != 0)
@@ -1537,6 +2244,14 @@ static LogicalResult
 vectorizeLoopNest(std::vector<SmallVector<AffineForOp, 2>> &loops,
                   const VectorizationStrategy &strategy) {
   assert(loops[0].size() == 1 && "Expected single root loop");
+  llvm::errs() << "SuperVectorize.cpp::vectorizeLoopNest(): loops: \n";
+  for(auto loop : loops) {
+    for(auto l : loop) {
+      llvm::errs() << "  " << l << "\n\n\n\n\n";
+    }
+  }
+  llvm::errs() << "SuperVectorize.cpp::vectorizeLoopNest(): loops: end\n";
+
   AffineForOp rootLoop = loops[0][0];
   VectorizationState state(rootLoop.getContext());
   state.builder.setInsertionPointAfter(rootLoop);
@@ -1564,6 +2279,7 @@ vectorizeLoopNest(std::vector<SmallVector<AffineForOp, 2>> &loops,
 
   auto opVecResult = rootLoop.walk<WalkOrder::PreOrder>([&](Operation *op) {
     LLVM_DEBUG(dbgs() << "[early-vect]+++++ Vectorizing: " << *op);
+    llvm::errs() << "\nSuperVectorize.cpp::vectorizeLoopNest(): Vectorizing: " << *op << "\n";
     Operation *vectorOp = vectorizeOneOperation(op, state);
     if (!vectorOp) {
       LLVM_DEBUG(
@@ -1571,6 +2287,7 @@ vectorizeLoopNest(std::vector<SmallVector<AffineForOp, 2>> &loops,
                  << *op << "\n");
       return WalkResult::interrupt();
     }
+    llvm::errs() << "SuperVectorize.cpp::vectorizeLoopNest(): Vectorized: " << *vectorOp << "\n";
 
     return WalkResult::advance();
   });
@@ -1672,6 +2389,7 @@ static void vectorizeLoops(Operation *parentOp, DenseSet<Operation *> &loops,
       makePattern(loops, vectorSizes.size(), fastestVaryingPattern);
   if (!pattern) {
     LLVM_DEBUG(dbgs() << "\n[early-vect] pattern couldn't be computed\n");
+    llvm::errs() << "SuperVectorize.cpp::vectorizeLoops(): Pattern couldn't be computed\n";
     return;
   }
 
@@ -1685,9 +2403,16 @@ static void vectorizeLoops(Operation *parentOp, DenseSet<Operation *> &loops,
   // Compute all the pattern matches and classify them into buckets of
   // intersecting matches.
   SmallVector<NestedMatch, 32> allMatches;
+  llvm::errs() << "SuperVectorize.cpp::vectorizeLoops(): before pattern->match\n";
   pattern->match(parentOp, &allMatches);
+  llvm::errs() << "SuperVectorize.cpp::vectorizeLoops(): after pattern->match\n";
+  llvm::errs() << "SuperVectorize.cpp::vectorizeLoops(): allMatches.size(): " << allMatches.size() << "\n";
   std::vector<SmallVector<NestedMatch, 8>> intersectionBuckets;
   computeIntersectionBuckets(allMatches, intersectionBuckets);
+  llvm::errs() << "SuperVectorize.cpp::vectorizeLoops(): intersectionBuckets.size(): " << intersectionBuckets.size() << "\n";
+  for(auto &bucket : intersectionBuckets){
+    llvm::errs() << "  SuperVectorize.cpp::vectorizeLoops(): bucket.size(): " << bucket.size() << "\n";
+  }
 
   // Iterate over all buckets and vectorize the matches eagerly. We can only
   // vectorize one match from each bucket since all the matches within a bucket
@@ -1712,6 +2437,13 @@ static void vectorizeLoops(Operation *parentOp, DenseSet<Operation *> &loops,
         break;
     }
   }
+
+  // Here can not print the loops, will cause Segmentation fault.
+  // llvm::errs() << "vectorizeLoops(): loops: \n";
+  // for (auto loop : loops) {
+  //   loop->print(llvm::errs());
+  //   llvm::errs() << "---------------------------------------------\n";
+  // }
 
   LLVM_DEBUG(dbgs() << "\n");
 }
@@ -1749,10 +2481,38 @@ void Vectorize::runOnOperation() {
     });
   } else {
     f.walk([&parallelLoops](AffineForOp loop) {
-      if (isLoopParallel(loop))
+      // TODO: Here is temporary logic!!!
+      // if (isLoopParallel(loop))
         parallelLoops.insert(loop);
     });
   }
+
+  llvm::errs() << "Vectorize::runOnOperation(): parallel loops: \n";
+  for (auto loop : parallelLoops) {
+    loop->print(llvm::errs());
+    // TODO: Note: the erase loop logic is just for this gemv!
+    // 以后应该去识别metadata: cuda_thread_loop
+    // 之类的, 有这个metadata的才进行向量化 
+    // if current has include affine.if or affine.for, do not erase it.
+    
+    auto walkResult = loop->walk([](Operation *op) {
+      if(isa<AffineIfOp>(op) || isa<arith::RemUIOp>(op)) {
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (!walkResult.wasInterrupted()) {
+      parallelLoops.erase(loop);
+    }
+    llvm::errs() << "---------------------------------------------\n";
+  }
+
+  llvm::errs() << "Vectorize::runOnOperation(): after erase, parallel loops: \n";
+  for (auto loop : parallelLoops) {
+    loop->print(llvm::errs());
+    llvm::errs() << "---------------------------------------------\n";
+  }
+
 
   // Thread-safe RAII local context, BumpPtrAllocator freed on exit.
   NestedPatternContext mlContext;
