@@ -194,6 +194,16 @@ def VTanhF32Op : NPU_Op<"vtanh_f32", [Pure]> {
   ];
 }
 
+def VSigmoidF32Op : NPU_Op<"vsigmoid_f32", [Pure]> {
+  let summary = "Vector float32 sigmoid operation";
+  let description = [{
+    The `vsigmoid_f32` operation compute sigmoid value of input vector element-wise.
+  }];
+
+  let arguments = (ins AnyVector:$operand, I32Attr:$numElems);
+  let results = (outs AnyVector:$res);
+}
+
 def VRecipF32Op : NPU_Op<"vrecip_f32", [Pure]> {
   let summary = "Vector float32 recip operation";
   let description = [{
