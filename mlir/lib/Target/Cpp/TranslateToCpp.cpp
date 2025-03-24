@@ -6,28 +6,30 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/NPU/IR/NPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Support/IndentedOstream.h"
+#include "mlir/Support/LLVM.h"
 #include "mlir/Target/Cpp/CppEmitter.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/ScopedHashTable.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Demangle/Demangle.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FormatVariadic.h"
-#include "mlir/Dialect/NPU/IR/NPUDialect.h"
-#include "llvm/Demangle/Demangle.h"
+#include <stack>
 #include <utility>
 
 #define DEBUG_TYPE "translate-to-cpp"
@@ -36,8 +38,8 @@ using namespace mlir;
 using namespace mlir::emitc;
 using llvm::formatv;
 
-// #define GEN_CCE_CODE
-#define GEN_BISHENGCPP_CODE
+#define GEN_CCE_CODE
+// #define GEN_BISHENGCPP_CODE
 
 /// Convenience functions to produce interleaved output with functions returning
 /// a LogicalResult. This is different than those in STLExtras as functions used
@@ -84,15 +86,63 @@ inline LogicalResult interleaveAddWithError(const Container &c, raw_ostream &os,
                              [&]() { os << " + "; });
 }
 
+/// Return the precedence of a operator as an integer, higher values
+/// imply higher precedence.
+static FailureOr<int> getOperatorPrecedence(Operation *operation) {
+  return llvm::TypeSwitch<Operation *, FailureOr<int>>(operation)
+      .Case<emitc::AddOp>([&](auto op) { return 12; })
+      .Case<emitc::ApplyOp>([&](auto op) { return 15; })
+      .Case<emitc::BitwiseAndOp>([&](auto op) { return 7; })
+      .Case<emitc::BitwiseLeftShiftOp>([&](auto op) { return 11; })
+      .Case<emitc::BitwiseNotOp>([&](auto op) { return 15; })
+      .Case<emitc::BitwiseOrOp>([&](auto op) { return 5; })
+      .Case<emitc::BitwiseRightShiftOp>([&](auto op) { return 11; })
+      .Case<emitc::BitwiseXorOp>([&](auto op) { return 6; })
+      // .Case<emitc::CallOp>([&](auto op) { return 16; })
+      .Case<emitc::CallOpaqueOp>([&](auto op) { return 16; })
+      .Case<emitc::CastOp>([&](auto op) { return 15; })
+      .Case<emitc::CmpOp>([&](auto op) -> FailureOr<int> {
+        switch (op.getPredicate()) {
+        case emitc::CmpPredicate::eq:
+        case emitc::CmpPredicate::ne:
+          return 8;
+        case emitc::CmpPredicate::lt:
+        case emitc::CmpPredicate::le:
+        case emitc::CmpPredicate::gt:
+        case emitc::CmpPredicate::ge:
+          return 9;
+        case emitc::CmpPredicate::three_way:
+          return 10;
+        }
+        return op->emitError("unsupported cmp predicate");
+      })
+      .Case<emitc::ConditionalOp>([&](auto op) { return 2; })
+      .Case<emitc::DivOp>([&](auto op) { return 13; })
+      .Case<emitc::LogicalAndOp>([&](auto op) { return 4; })
+      .Case<emitc::LogicalNotOp>([&](auto op) { return 15; })
+      .Case<emitc::LogicalOrOp>([&](auto op) { return 3; })
+      .Case<emitc::MulOp>([&](auto op) { return 13; })
+      .Case<emitc::RemOp>([&](auto op) { return 13; })
+      .Case<emitc::SubOp>([&](auto op) { return 12; })
+      .Case<emitc::UnaryMinusOp>([&](auto op) { return 15; })
+      .Case<emitc::UnaryPlusOp>([&](auto op) { return 15; })
+      .Default([](auto op) { return op->emitError("unsupported operation"); });
+}
+
 namespace {
 /// Emitter that uses dialect specific emitters to emit C++ code.
 struct CppEmitter {
-  explicit CppEmitter(raw_ostream &os, bool declareVariablesAtTop);
+  explicit CppEmitter(raw_ostream &os, bool declareVariablesAtTop/*,
+                      StringRef fileId*/);
 
   /// Emits attribute or returns failure.
   LogicalResult emitAttribute(Location loc, Attribute attr);
 
   /// Emits operation 'op' with/without training semicolon or returns failure.
+  ///
+  /// For operations that should never be followed by a semicolon, like ForOp,
+  /// the `trailingSemicolon` argument is ignored and a semicolon is not
+  /// emitted.
   LogicalResult emitOperation(Operation &op, bool trailingSemicolon);
 
   /// Emits type 'type' or returns failure.
@@ -115,6 +165,10 @@ struct CppEmitter {
   LogicalResult emitVariableDeclaration(OpResult result,
                                         bool trailingSemicolon);
 
+  /// Emits a declaration of a variable with the given type and name.
+  LogicalResult emitVariableDeclaration(Location loc, Type type,
+                                        StringRef name);
+
   /// Emits the variable declaration and assignment prefix for 'op'.
   /// - emits separate variable followed by std::tie for multi-valued operation;
   /// - emits single type followed by variable for single result;
@@ -122,6 +176,9 @@ struct CppEmitter {
   /// Emits final '=' operator where a type is produced. Returns failure if
   /// any result type could not be converted.
   LogicalResult emitAssignPrefix(Operation &op);
+
+  /// Emits a global variable declaration or definition.
+  LogicalResult emitGlobalVariable(GlobalOp op);
 
   /// Emits a label for the block.
   LogicalResult emitLabel(Block &block);
@@ -137,8 +194,26 @@ struct CppEmitter {
   /// Emits the operands of the operation. All operands should be added together.
   LogicalResult emitAddLikeOperands(Operation &op);
 
+  /// Emits value as an operands of an operation
+  LogicalResult emitOperand(Value value);
+
+  /// Emit an expression as a C expression.
+  LogicalResult emitExpression(ExpressionOp expressionOp);
+
+  /// Insert the expression representing the operation into the value cache.
+  void cacheDeferredOpResult(Value value, StringRef str);
+
   /// Return the existing or a new name for a Value.
   StringRef getOrCreateName(Value val);
+
+  // Returns the textual representation of a subscript operation.
+  std::string getSubscriptName(emitc::SubscriptOp op);
+
+  // Returns the textual representation of a member (of object) operation.
+  std::string createMemberAccess(emitc::MemberOp op);
+
+  // Returns the textual representation of a member of pointer operation.
+  std::string createMemberAccess(emitc::MemberOfPtrOp op);
 
   /// Return the existing or a new label of a Block.
   StringRef getOrCreateName(Block &block);
@@ -178,6 +253,26 @@ struct CppEmitter {
   /// be declared at the beginning of a function.
   bool shouldDeclareVariablesAtTop() { return declareVariablesAtTop; };
 
+  // /// Returns whether this file op should be emitted
+  // bool shouldEmitFile(FileOp file) {
+  //   return !fileId.empty() && file.getId() == fileId;
+  // }
+
+  /// Get expression currently being emitted.
+  ExpressionOp getEmittedExpression() { return emittedExpression; }
+
+  /// Determine whether given value is part of the expression potentially being
+  /// emitted.
+  bool isPartOfCurrentExpression(Value value) {
+    if (!emittedExpression)
+      return false;
+    Operation *def = value.getDefiningOp();
+    if (!def)
+      return false;
+    auto operandExpression = dyn_cast<ExpressionOp>(def->getParentOp());
+    return operandExpression == emittedExpression;
+  };
+
 private:
   using ValueMapper = llvm::ScopedHashTable<Value, std::string>;
   using BlockMapper = llvm::ScopedHashTable<Block *, std::string>;
@@ -190,6 +285,9 @@ private:
   /// includes results from ops located in nested regions.
   bool declareVariablesAtTop;
 
+  // /// Only emit file ops whos id matches this value.
+  // std::string fileId;
+
   /// Map from value to name of C++ variable that contain the name.
   ValueMapper valueMapper;
 
@@ -200,8 +298,61 @@ private:
   /// names of values in a scope.
   std::stack<int64_t> valueInScopeCount;
   std::stack<int64_t> labelInScopeCount;
+
+  /// State of the current expression being emitted.
+  ExpressionOp emittedExpression;
+  SmallVector<int> emittedExpressionPrecedence;
+
+  void pushExpressionPrecedence(int precedence) {
+    emittedExpressionPrecedence.push_back(precedence);
+  }
+  void popExpressionPrecedence() { emittedExpressionPrecedence.pop_back(); }
+  static int lowestPrecedence() { return 0; }
+  int getExpressionPrecedence() {
+    if (emittedExpressionPrecedence.empty())
+      return lowestPrecedence();
+    return emittedExpressionPrecedence.back();
+  }
 };
 } // namespace
+
+/// Determine whether expression \p op should be emitted in a deferred way.
+static bool hasDeferredEmission(Operation *op) {
+  return isa_and_nonnull<emitc::GetGlobalOp, emitc::LiteralOp, emitc::MemberOp,
+                         emitc::MemberOfPtrOp, emitc::SubscriptOp>(op);
+}
+
+/// Determine whether expression \p expressionOp should be emitted inline, i.e.
+/// as part of its user. This function recommends inlining of any expressions
+/// that can be inlined unless it is used by another expression, under the
+/// assumption that  any expression fusion/re-materialization was taken care of
+/// by transformations run by the backend.
+static bool shouldBeInlined(ExpressionOp expressionOp) {
+  // Do not inline if expression is marked as such.
+  if (expressionOp.getDoNotInline())
+    return false;
+
+  // Do not inline expressions with side effects to prevent side-effect
+  // reordering.
+  if (expressionOp.hasSideEffects())
+    return false;
+
+  // Do not inline expressions with multiple uses.
+  Value result = expressionOp.getResult();
+  if (!result.hasOneUse())
+    return false;
+
+  Operation *user = *result.getUsers().begin();
+
+  // Do not inline expressions used by operations with deferred emission, since
+  // their translation requires the materialization of variables.
+  if (hasDeferredEmission(user))
+    return false;
+
+  // Do not inline expressions used by ops with the CExpression trait. If this
+  // was intended, the user could have been merged into the expression op.
+  return !user->hasTrait<OpTrait::emitc::CExpression>();
+}
 
 static LogicalResult printConstantOp(CppEmitter &emitter, Operation *operation,
                                      Attribute value) {
@@ -252,32 +403,19 @@ static LogicalResult printOperation(CppEmitter &emitter,
 }
 
 static LogicalResult printOperation(CppEmitter &emitter,
-                                    arith::ConstantOp constantOp) {
-  Operation *operation = constantOp.getOperation();
-  Attribute value = constantOp.getValue();
+                                    emitc::GlobalOp globalOp) {
 
-  return printConstantOp(emitter, operation, value);
-}
-
-static LogicalResult printOperation(CppEmitter &emitter,
-                                    func::ConstantOp constantOp) {
-  Operation *operation = constantOp.getOperation();
-  Attribute value = constantOp.getValueAttr();
-
-  return printConstantOp(emitter, operation, value);
+  return emitter.emitGlobalVariable(globalOp);
 }
 
 static LogicalResult printOperation(CppEmitter &emitter,
                                     emitc::AssignOp assignOp) {
-  auto variableOp = cast<emitc::VariableOp>(assignOp.getVar().getDefiningOp());
-  OpResult result = variableOp->getResult(0);
+  OpResult result = assignOp.getVar().getDefiningOp()->getResult(0);
 
   if (failed(emitter.emitVariableAssignment(result)))
     return failure();
 
-  emitter.ostream() << emitter.getOrCreateName(assignOp.getValue());
-
-  return success();
+  return emitter.emitOperand(assignOp.getValue());
 }
 
 // Process the builtin.unrealized_conversion_cast operation:
@@ -343,70 +481,6 @@ static LogicalResult printLLVMGEPOp(CppEmitter &emitter,
   return failure();
 }
 
-#ifdef GEN_BISHENGCPP_CODE
-// Process the npu.mov_out_to_ub operation:
-//   %5 = "npu.mov_out_to_ub"(%4) <{numElems = 8 : i32}> : (!llvm.ptr<1>) ->
-//   vector<8xf32>
-//   ->
-//   dmi::memcpy_elems(i5.data(), i4, 8);
-//      (copy 8 elements from i4 to i5)
-static LogicalResult printNPUOp(CppEmitter &emitter,
-                                npu::MovOutToUBOp movOutToUBOp) {
-  raw_ostream &os = emitter.ostream();
-  // MLIR is SSA, so the `res` of mov_out_to_ub has not used and not declared
-  // before, here is the 1st time use it. So we can alloca UB vector here.
-  // TODO: But, theoretically, we should add npu.alloca() before this stage, and
-  // use npu.mov_out_to_ub() by this way: npu.mov_out_to_ub(dst_ub, src_gm). Now
-  // it is just a temporary solution.
-
-  // print alloca UB vector, like: vector<float, 8> i5;
-  // get element type and numElems of res.
-  auto movType = movOutToUBOp.getRes().getType();   // Res type is vector<Nxf32>
-  // TODO: Here should modify emitType() to print VectorType, but it has no
-  // addrspace info, so temporarily process it here.
-  assert(isa<VectorType>(movType) &&
-         "ICT_ERROR(): mov_out_to_ub's res type is not vector type!");
-  auto vecType = movType.cast<VectorType>();
-  auto elemType = vecType.getElementType();   // vector's element type, such as float
-  if (vecType.getShape().size() != 1) {
-    return emitError(movOutToUBOp.getLoc(),
-                     "ICT_ERROR(): mov_out_to_ub's res type is not 1D vector!");
-  }
-  auto numElems = vecType.getShape()[0];
-  // NPU should has no basic type which size > float(i.e. 4 bytes), so here mod
-  // 8 is enough.
-  if (numElems % 8 != 0) {
-    return emitError(movOutToUBOp.getLoc(),
-                     "ICT_ERROR(): mov_out_to_ub's res type's numElems is not "
-                     "multiple of 8!");
-  }
-  if(numElems > 256) {
-    return emitError(movOutToUBOp.getLoc(),
-                     "ICT_ERROR(): mov_out_to_ub's res type's numElems is larger "
-                     "than 256!");
-  }
-
-  os << "vector<";
-  if(failed(emitter.emitType(movOutToUBOp.getLoc(), elemType)))
-    return failure();
-  os << ", ";
-  os << numElems;
-  os << "> ";
-  os << emitter.getOrCreateName(movOutToUBOp.getRes());
-  os << ";\n";
-  // Here, has print: vector<float, 8> i5;
-
-  os << "dmi::memcpy_elems(";   // callee name
-  os << emitter.getOrCreateName(movOutToUBOp.getRes());
-  os << ".data(), ";
-  os << emitter.getOrCreateName(movOutToUBOp.getSrcAddr());
-  os << ", ";
-  os << numElems;
-  os << ")";
-  // Here, has print: dmi::memcpy_elems(i5.data(), i4, 8);
-  return success();
-}
-#else 
 // Process the npu.mov_out_to_ub operation:
 //   %5 = "npu.mov_out_to_ub"(%4) <{numElems = 8 : i32}> : (!llvm.ptr<1>) ->
 //   vector<8xf32>
@@ -466,57 +540,7 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   //   copy_gm_to_ubuf((__ubuf__ float *)i5, (__gm__ float *)i4, 0, 1, 1, 0, 0);
   return success();
 }
-#endif
 
-
-#ifdef GEN_BISHENGCPP_CODE
-// Process the npu.mov_ub_to_out operation:
-//   "npu.mov_ub_to_out"(%9, %8) <{numElems = 8 : i32}> : (!llvm.ptr<1>, vector<8xf32>) -> ()
-//   ->
-//   dmi::memcpy_elems(i9, i8.data(), 8);
-//      (copy 8 elements from i8 to i9)
-static LogicalResult printNPUOp(CppEmitter &emitter,
-                                npu::MovUBToOutOp movUBToOUTOp) {
-  raw_ostream &os = emitter.ostream();
-
-  // get numElems of res.
-  // valueToStore type is vector<Nxf32>
-  auto movType = movUBToOUTOp.getValueToStore().getType();
-  // TODO: Here should modify emitType() to print VectorType, but it has no
-  // addrspace info, so temporarily process it here.
-  assert(isa<VectorType>(movType) &&
-         "ICT_ERROR(): mov_ub_to_out's res type is not vector type!");
-  auto vecType = movType.cast<VectorType>();
-  if (vecType.getShape().size() != 1) {
-    return emitError(movUBToOUTOp.getLoc(),
-                     "ICT_ERROR(): mov_ub_to_out's res type is not 1D vector!");
-  }
-  auto numElems = vecType.getShape()[0];
-  // NPU should has no basic type which size > float(i.e. 4 bytes), so here mod
-  // 8 is enough.
-  if (numElems % 8 != 0) {
-    return emitError(movUBToOUTOp.getLoc(),
-                     "ICT_ERROR(): mov_ub_to_out's res type's numElems is not "
-                     "multiple of 8!");
-  }
-  if(numElems > 256) {
-    return emitError(movUBToOUTOp.getLoc(),
-                     "ICT_ERROR(): mov_ub_to_out's res type's numElems is larger "
-                     "than 256!");
-  }
-
-  os << "dmi::memcpy_elems(";   // callee name
-  os << emitter.getOrCreateName(movUBToOUTOp.getDstAddr());
-  os << ", ";
-  os << emitter.getOrCreateName(movUBToOUTOp.getValueToStore());
-  os << ".data(), ";
-  os << numElems;
-  os << ");";
-  // Here, has print: dmi::memcpy_elems(i9, i8.data(), 8);
-
-  return success();
-}
-#else 
 // Process the npu.mov_ub_to_out operation:
 // "npu.mov_ub_to_out"(%9, %8) <{numElems = 8 : i32}> : (!llvm.ptr<1>, vector<8xf32>) -> ()
 // ->
@@ -570,57 +594,7 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   //   copy_ubuf_to_gm((__gm__ float *)i9, (__ubuf__ float *)i8, 0, 1, 1, 0, 0);
   return success();
 }
-#endif
 
-// Because we translate from CUDA, CUDA in MLIR is SSA, so instructions like
-// mov_out_to_ub, vadd, etc, their res is not used before, so we need alloca UB
-// vector here. So here, we assume the npu.vadd's res is also 1st time used, so we
-// need alloca UB vector here.
-#ifdef GEN_BISHENGCPP_CODE
-// Process the npu.vadd operation:
-// %8 = "npu.vadd"(%5, %7) <{numElems = 8 : i32}> : (vector<8xf32>,
-// vector<8xf32>) -> vector<8xf32>
-// ->
-// vec_add(i8, i5, i7);
-//    (add 8 elements from i5 and i7 to i8)
-static LogicalResult printNPUOp(CppEmitter &emitter,
-                                    npu::VAddF32Op vAddF32Op) {
-  raw_ostream &os = emitter.ostream();
-  // print alloca UB vector, like: vector<float, 8> i8;
-  // get element type and numElems of res.
-  auto dstType = vAddF32Op.getRes().getType();
-  assert(isa<VectorType>(dstType) &&
-         "ICT_ERROR(): vadd's res type is not vector type!");
-  auto vecType = dstType.cast<VectorType>();
-  auto elemType = vecType.getElementType();   // vector's element type, such as float
-  auto numElems = vAddF32Op.getNumElems();
-  if(numElems % 8 != 0) {
-    return emitError(vAddF32Op.getLoc(),
-                     "ICT_ERROR(): vadd's numElems is not multiple of 8!");
-  }
-  
-  os << "vector<";
-  if(failed(emitter.emitType(vAddF32Op.getLoc(), elemType)))
-    return failure();
-  os << ", ";
-  os << numElems;
-  os << "> ";
-  os << emitter.getOrCreateName(vAddF32Op.getRes());
-  os << ";\n";
-  // Here, has print: vector<float, 8> i8;
-
-  os << "vec_add(";   // callee name
-  os << emitter.getOrCreateName(vAddF32Op.getRes());
-  os << ", ";
-  os << emitter.getOrCreateName(vAddF32Op.getLhs());
-  os << ", ";
-  os << emitter.getOrCreateName(vAddF32Op.getRhs());
-  os << ")";
-  // Here has print:
-  //  vec_add(i8, i5, i7);
-  return success();
-}
-#else
 // Process the npu.vadd operation:
 // %8 = "npu.vadd"(%5, %7) <{numElems = 8 : i32}> : (vector<8xf32>,
 // vector<8xf32>) -> vector<8xf32>
@@ -702,7 +676,493 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   //  vadd((__ubuf__ float *)i8, (__ubuf__ float *)i5, (__ubuf__ float *)i7, 1, 1, 1, 1, 8, 8, 8);
   return success();
 }
-#endif
+
+// Process the npu.vadd_i32 operation:
+// %27 = "npu.vadd_i32"(%26, %18) <{numElems = 8 : i32}> : (vector<8xi32>, vector<8xi32>) -> vector<8xi32>
+// ->
+// vadd((__ubuf__ int32_t *)i27, (__ubuf__ int32_t *)i26, (__ubuf__ int32_t *)i18, 1, 1, 1, 1, 8, 8, 8);
+
+// uint8_t RepeatTime, uint8_t DstBlock, uint8_t SrcBlock0, uint8_t SrcBlock1,
+// uint8_t DstStride, uint8_t SrcStride0, uint8_t SrcStride1
+// repeat
+// 1次, 每次有8个32B, 111代表这8个32B之间是连续的, 888表示大片段之间是连续的
+// vadd(dst, src1, src2, RepeatTime, DstBlock, SrcBlock0, SrcBlock1, DstStride,
+//      SrcStride0, SrcStride1)
+
+
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::VAddI32Op vAddI32Op) {
+  raw_ostream &os = emitter.ostream();
+  os << "vadd(";   // callee name
+
+  // print dst addr
+  auto dstType = vAddI32Op.getRes().getType();
+  assert(isa<VectorType>(dstType) &&
+         "ICT_ERROR(): vadd_i32's res type is not vector type!");
+  auto dstVecType = dstType.cast<VectorType>();
+  
+  os << "(";
+  if(failed(emitter.emitType(vAddI32Op.getLoc(), dstVecType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(vAddI32Op.getRes());
+  os << ", ";
+  // Here, has print: vadd((__ubuf__ int32_t *)i27, 
+
+  // TODO: 这里的 type其实重叠了，src1和src2不用再提取type的，因为必须得和dst一样。
+  // print src1 addr
+  os << "(";
+  if(failed(emitter.emitType(vAddI32Op.getLoc(), dstVecType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(vAddI32Op.getLhs());
+  os << ", ";
+  // Here, has print: vadd((__ubuf__ int32_t *)i27, (__ubuf__ int32_t *)i26, 
+
+  // print src2 addr
+  os << "(";
+  if(failed(emitter.emitType(vAddI32Op.getLoc(), dstVecType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(vAddI32Op.getRhs());
+  os << ", ";
+  // Here, has print: vadd((__ubuf__ int32_t *)i27, (__ubuf__ int32_t *)i26, (__ubuf__ int32_t *)i18,
+
+  // print configs.
+  auto numElems = vAddI32Op.getNumElems();
+  if(numElems % 8 != 0) {
+    return emitError(vAddI32Op.getLoc(),
+                     "ICT_ERROR(): vadd_i32's numElems is not multiple of 8!");
+  }
+  auto dstElemType = dstVecType.getElementType();   // vector's element type, such as int32_t
+  auto repeatTime = numElems * dstElemType.getIntOrFloatBitWidth() / 256;
+  os << repeatTime << ", 1, 1, 1, 8, 8, 8)";
+  // Here has print:
+  //  vadd((__ubuf__ int32_t *)i27, (__ubuf__ int32_t *)i26, (__ubuf__ int32_t *)i18, 1, 1, 1, 1, 8, 8, 8);
+  return success();
+}
+
+// Process the npu.vmul_f32 operation:
+// %77 = "npu.vmul_f32"(%76, %56) <{numElems = 8 : i32}> : (vector<8xf32>, vector<8xf32>) -> vector<8xf32>
+// ->
+// vmul((__ubuf__ float *)i_8, (__ubuf__ float *)i_7, (__ubuf__ float *)i_5, 1, 1, 1, 1, 8, 8, 8);
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::VMulF32Op vMulF32Op) {
+  raw_ostream &os = emitter.ostream();
+  os << "vmul(";   // callee name
+
+  // print dst addr
+  auto dstType = vMulF32Op.getRes().getType();
+  assert(isa<VectorType>(dstType) &&
+         "ICT_ERROR(): vmul_f32's res type is not vector type!");
+  auto dstVecType = dstType.cast<VectorType>();
+  os << "(";
+  if(failed(emitter.emitType(vMulF32Op.getLoc(), dstVecType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(vMulF32Op.getRes());
+  os << ", ";
+  // Here, has print: vmul((__ubuf__ float *)i_8, 
+
+  // print src1 addr
+  os << "(";
+  if(failed(emitter.emitType(vMulF32Op.getLoc(), dstVecType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(vMulF32Op.getLhs());
+  os << ", ";
+  // Here, has print: vmul((__ubuf__ float *)i_8, (__ubuf__ float *)i_7, 
+
+  // print src2 addr
+  os << "(";
+  if(failed(emitter.emitType(vMulF32Op.getLoc(), dstVecType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(vMulF32Op.getRhs());
+  os << ", ";
+  // Here, has print: vmul((__ubuf__ float *)i_8, (__ubuf__ float *)i_7, (__ubuf__ float *)i_5,
+
+  // print configs.
+  auto numElems = vMulF32Op.getNumElems();
+  if(numElems % 8 != 0) {
+    return emitError(vMulF32Op.getLoc(),
+                     "ICT_ERROR(): vmul_f32's numElems is not multiple of 8!");
+  }
+  auto repeatTime = numElems * dstVecType.getElementType().getIntOrFloatBitWidth() / 256;
+  os << repeatTime << ", 1, 1, 1, 8, 8, 8)";
+  // Here has print:
+  //  vmul((__ubuf__ float *)i_8, (__ubuf__ float *)i_7, (__ubuf__ float *)i_5, 1, 1, 1, 1, 8, 8, 8);
+  return success();
+}
+
+
+
+
+
+
+
+// Process the npu.vcmp_i32 operation:
+// %29 = "npu.vcmp_i32"(%28, %18) <{predicate = 0 : i64}> : (vector<8xi32>, vector<8xi32>) -> vector<8xi1>
+// ->
+// vcmpv_eq((__ubuf__ uint8_t *)i29, (__ubuf__ int32_t *)i28, (__ubuf__ int32_t *)i18, 1, 1, 1, 1, 8, 8, 8);
+
+// void vcmpv_eq(__ubuf__ uint8_t* dst, __ubuf__ int32_t* src0, __ubuf__
+// int32_t* src1, uint8_t repeat, uint8_t dstBlockStride, uint8_t
+// src0BlockStride, uint8_t src1BlockStride, uint8_t dstRepeatStride, uint8_t
+// src0RepeatStride, uint8_t src1RepeatStride);
+static LogicalResult printNPUOp(CppEmitter &emitter, npu::VCmpI32Op vCmpI32Op) {
+  auto pred = vCmpI32Op.getPredicate();
+  if(pred != npu::NPUCmpIPredicate::eq) {
+    llvm::errs() << "ICT_ERROR(): vcmp_i32's predicate is not 0! can not "
+                    "process! Ascend can only compare eq for i32\n";
+    exit(-1);
+  }
+
+  raw_ostream &os = emitter.ostream();
+  os << "vcmpv_eq((__ubuf__ uint8_t *)";   // callee name
+  // print dst addr
+  os << emitter.getOrCreateName(vCmpI32Op.getRes());
+  os << ", ";
+  // Here, has print: vcmpv_eq((__ubuf__ uint8_t *)i29, 
+
+  // print src1 addr
+  // TODO: 或许这里的operand的输出，可以用专门的翻译operand的函数来实现，应该可以简化一些。
+  auto src1Type = vCmpI32Op.getLhs().getType();    // lhs type is vector<Nxi32>
+  assert(isa<VectorType>(src1Type) &&
+         "ICT_ERROR(): vcmp_i32's lhs type is not vector type!");
+  auto src1VecType = src1Type.cast<VectorType>();
+  
+  os << "(";
+  if(failed(emitter.emitType(vCmpI32Op.getLoc(), src1VecType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(vCmpI32Op.getLhs());
+  os << ", ";
+  // Here, has print: vcmpv_eq((__ubuf__ uint8_t *)i29, (__ubuf__ int32_t *)i28, 
+
+  // print src2 addr
+  os << "(";
+  if(failed(emitter.emitType(vCmpI32Op.getLoc(), src1VecType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(vCmpI32Op.getRhs());
+  os << ", ";
+  // Here, has print: vcmpv_eq((__ubuf__ uint8_t *)i29, (__ubuf__ int32_t *)i28, (__ubuf__ int32_t *)i18,
+
+  // print configs.
+  auto numElems = src1VecType.getShape()[0];
+  if(numElems % 8 != 0) {
+    return emitError(vCmpI32Op.getLoc(),
+                     "ICT_ERROR(): vcmp_i32's numElems is not multiple of 8!");
+  }
+  auto src1ElemType = src1VecType.getElementType();   // vector's element type, such as i32
+  auto repeatTime = numElems * src1ElemType.getIntOrFloatBitWidth() / 256;
+  os << repeatTime << ", 1, 1, 1, 8, 8, 8)";
+  // Here has print:
+  //  vcmpv_eq((__ubuf__ uint8_t *)i29, (__ubuf__ int32_t *)i28, (__ubuf__ int32_t *)i18, 1, 1, 1, 1, 8, 8, 8);
+  return success();
+}
+
+// Process the npu.vsel operation:
+// %56 = "npu.vsel"(%29, %55, %19) <{numElems = 8 : i32}> : (vector<8xi1>, vector<8xf32>, vector<8xf32>) -> vector<8xf32>
+// ->
+// set_cmpmask((__ubuf__ uint8_t *)i29);
+// set_mask_norm();
+// set_vector_mask(0x0, 0xff);
+// vsel((__ubuf__ float *)i56, (__ubuf__ float *)i55, (__ubuf__ float *)i19, 1, 1, 1, 1, 8, 8, 8);
+// set_vector_mask(0xffffffffffffffff, 0xffffffffffffffff);
+// 后面那个set_vector_mask是否是否需要，我记不太清了...后面测试的时候再说；前面那个mask是否需要专门为了vsel而设置，我也记不太清了...所以先按没有vec_mask来走吧；
+static LogicalResult printNPUOp(CppEmitter &emitter, npu::VSelOp vSelOp) {
+  raw_ostream &os = emitter.ostream();
+  os << "set_cmpmask((__ubuf__ uint8_t *)";   // callee name
+  // print cmpmask addr
+  os << emitter.getOrCreateName(vSelOp.getMask());
+  os << ");\n";
+  // Here, has print: set_cmpmask((__ubuf__ uint8_t *)i29;
+
+  // TODO: 考虑一下设置vector mask？
+  // os << "set_mask_norm();\n";
+  // os << "set_vector_mask(0x0, 0xff);\n";
+  // // Here, has print: set_mask_norm(); set_vector_mask(0x0, 0xff);
+
+  os << "vsel((__ubuf__ float *)";   // callee name
+  // print dst addr
+  auto dstType = vSelOp.getRes().getType();
+  assert(isa<VectorType>(dstType) &&
+         "ICT_ERROR(): vsel's res type is not vector type!");
+  auto dstVecType = dstType.cast<VectorType>();
+  
+  os << "(";
+  if(failed(emitter.emitType(vSelOp.getLoc(), dstVecType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(vSelOp.getRes());
+  os << ", ";
+  // Here, has print: vsel((__ubuf__ float *)i56, 
+
+  // print src1 addr
+  os << "(";
+  if(failed(emitter.emitType(vSelOp.getLoc(), dstVecType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(vSelOp.getLhs());
+  os << ", ";
+  // Here, has print: vsel((__ubuf__ float *)i56, (__ubuf__ float *)i55,
+
+  // print src2 addr
+  os << "(";
+  if(failed(emitter.emitType(vSelOp.getLoc(), dstVecType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(vSelOp.getRhs());
+  os << ", ";
+  // Here, has print: vsel((__ubuf__ float *)i56, (__ubuf__ float *)i55, (__ubuf__ float *)i19,
+
+  // print configs.
+  auto numElems = dstVecType.getShape()[0];
+  if(numElems % 8 != 0) {
+    return emitError(vSelOp.getLoc(),
+                     "ICT_ERROR(): vsel's numElems is not multiple of 8!");
+  }
+  auto dstElemType = dstVecType.getElementType();   // vector's element type, such as float
+  auto repeatTime = numElems * dstElemType.getIntOrFloatBitWidth() / 256;
+  os << repeatTime << ", 1, 1, 1, 8, 8, 8)";
+  // Here has print:
+  //  vsel((__ubuf__ float *)i56, (__ubuf__ float *)i55, (__ubuf__ float *)i19, 1, 1, 1, 1, 8, 8, 8);
+  return success();
+}
+
+
+
+
+
+
+
+// Process the npu.broadcast_i32 operation:
+// %2 = "npu.broadcast_i32"(%c32_i32) <{numElems = 8 : i32}> : (i32) -> vector<8xi32>
+// ->
+// vector_dup((__ubuf__ int32_t *)i_4_arg3_vec, i_arg3, 1, 1, 0, 8, 0);
+// 1, 1, 0, 8, 0:
+// uint8_t repeat, uint16_t dstBlockStride, uint16_t srcBlockStride, 
+// uint8_t dstRepeatStride, uint8_t srcRepeatStride
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::BroadCastI32Op broadcastI32Op) {
+  raw_ostream &os = emitter.ostream();
+  os << "vector_dup((__ubuf__ int32_t *)";
+  auto dstType = broadcastI32Op.getRes().getType();
+  assert(isa<VectorType>(dstType) &&
+         "ICT_ERROR(): broadcast_i32's res type is not vector type!");
+  auto vecType = dstType.cast<VectorType>();
+  auto elemType = vecType.getElementType();   // vector's element type, such as int32_t
+  os << emitter.getOrCreateName(broadcastI32Op.getRes());
+  os << ", ";
+  os << emitter.getOrCreateName(broadcastI32Op.getScalar());
+  auto numElems = broadcastI32Op.getNumElems();
+  if(numElems % 8 != 0) {
+    return emitError(broadcastI32Op.getLoc(),
+                     "ICT_ERROR(): broadcast_i32's numElems is not multiple of 8!");
+  }
+  // TODO: 这里这个repeatTime的计算，难道也得体现在生成的cce程序中吗？
+  auto repeatTime = numElems * elemType.getIntOrFloatBitWidth() / 256;
+  os << repeatTime << ", 1, 0, 8, 0)";
+  return success();
+}
+
+// Process the npu.movev_f32 operation:
+// %4 = "npu.movev_f32"(%cst) <{numElems = 8 : i32}> : (f32) -> vector<8xf32>
+// ->
+// vector_dup((__ubuf__ float *)i_cst_0, %cst, 1, 1, 0, 8, 0);
+// 实际上，这个的处理和BroadCastI32Op的处理是一样的，只是类型从i32换成了f32
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::MOVEVF32Op moveVF32Op) {
+  raw_ostream &os = emitter.ostream();
+  os << "vector_dup((__ubuf__ float *)";
+  auto dstType = moveVF32Op.getRes().getType();
+  assert(isa<VectorType>(dstType) &&
+         "ICT_ERROR(): movev_f32's res type is not vector type!");
+  auto vecType = dstType.cast<VectorType>();
+  auto elemType = vecType.getElementType();   // vector's element type, such as float
+  os << emitter.getOrCreateName(moveVF32Op.getRes());
+  os << ", ";
+  os << emitter.getOrCreateName(moveVF32Op.getScalar());
+  auto numElems = moveVF32Op.getNumElems();
+  if(numElems % 8 != 0) {
+    return emitError(moveVF32Op.getLoc(),
+                     "ICT_ERROR(): movev_f32's numElems is not multiple of 8!");
+  }
+  // TODO: 这里这个repeatTime的计算，难道也得体现在生成的cce程序中吗？不对吧，这里这个repeatTime应该是编译时已知的吧；而且在这里就是个unsigned int，应该是可以直接输出为数字的。
+  auto repeatTime = numElems * elemType.getIntOrFloatBitWidth() / 256;
+  os << repeatTime << ", 1, 0, 8, 0)";
+  return success();
+}
+
+// Process the npu.atomic_add_f32 operation:
+// "npu.atomic_add_f32"(%53, %36) <{numElems = 8 : i32}> : (!llvm.ptr<1>, vector<8xf32>) -> ()
+// ->
+// set_atomic_add();
+// set_atomic_f32();
+// copy_ubuf_to_gm((__gm__ void*)i_arg1_4, (__ubuf__ void*)i_cst_0, 0, 1, 1, 0, 0);
+// set_atomic_none();
+
+// void copy_ubuf_to_gm(__gm__ void* dst, __ubuf__ void* src, uint8_t sid,
+// uint16_t nBurst, uint16_t lenBurst, uint16_t srcStride, uint16_t dstStride);
+// nBurst: 数据块的数量
+// lenBurst: 每个数据块的长度(以32 bytes为单位)
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::AtomicAddF32Op atomicAddF32Op) {
+  raw_ostream &os = emitter.ostream();
+  os << "set_atomic_add();\n";
+  os << "set_atomic_f32();\n";
+  os << "copy_ubuf_to_gm((__gm__ void*)";
+  auto dstType = atomicAddF32Op.getDstAddr().getType();
+  assert(isa<LLVM::LLVMPointerType>(dstType) &&
+         "ICT_ERROR(): atomic_add_f32's dst type is not llvm.ptr<1> type!");
+  os << emitter.getOrCreateName(atomicAddF32Op.getDstAddr());
+  os << ", (__ubuf__ void*)";
+  auto srcType = atomicAddF32Op.getValueToAdd().getType();
+  assert(isa<VectorType>(srcType) &&
+         "ICT_ERROR(): atomic_add_f32's src type is not vector type!");
+  os << emitter.getOrCreateName(atomicAddF32Op.getValueToAdd());
+
+  // compute config value
+  unsigned sid = 0;
+  unsigned numElem = atomicAddF32Op.getNumElems();
+  if(numElem % 8 != 0) {
+    return emitError(atomicAddF32Op.getLoc(),
+                     "ICT_ERROR(): atomic_add_f32's numElems is not multiple of 8!");
+  }
+  unsigned nBurst = 1;
+  unsigned lenBurst = numElem * sizeof(float) / 32;
+  os << ", " << sid << ", " << nBurst << ", " << lenBurst << ", 0, 0);\n";
+  os << "set_atomic_none();";
+  return success();
+}
+
+
+
+
+
+
+
+
+
+
+
+// Process the npu.assign_ub_i32 operation:
+// "npu.assign_ub_i32"(%3) <{index = 0 : i32, srcScalar = 0 : i32}> : (vector<8xi32>) -> ()
+// ->
+// *((__ubuf__ int32_t *)i_cst_1 + 0) = 0;  // 这里的0为常量，比如说，可以为0-7等等
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::AssignUBI32Op assignUBI32Op) {
+  raw_ostream &os = emitter.ostream();
+  os << "*((__ubuf__ int32_t *)";
+  auto dstVectorType = assignUBI32Op.getDstVector().getType();
+  assert(isa<VectorType>(dstVectorType) &&
+         "ICT_ERROR(): assign_ub_i32's dst type is not vector type!");
+  os << emitter.getOrCreateName(assignUBI32Op.getDstVector());
+  os << " + ";
+  os << assignUBI32Op.getIndex();
+  os << ") = ";
+  os << assignUBI32Op.getSrcScalar();
+  return success();
+}
+
+// Process the npu.load_ub_i32 operation:
+// %29 = "npu.load_ub_i32"(%27) <{index = 0 : i32}> : (vector<8xi32>) -> i32
+// ->
+// int32_t i = *((__ubuf__ int32_t *)i27 + 0);
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::LoadUBI32Op loadUBI32Op) {
+  raw_ostream &os = emitter.ostream();
+  os << "int32_t ";
+  os << emitter.getOrCreateName(loadUBI32Op.getRes());
+  os << " = *((__ubuf__ int32_t *)";
+  auto srcVectorType = loadUBI32Op.getSrcVector().getType();
+  assert(isa<VectorType>(srcVectorType) &&
+         "ICT_ERROR(): load_ub_i32's src type is not vector type!");
+  os << emitter.getOrCreateName(loadUBI32Op.getSrcVector());
+  os << " + ";
+  os << loadUBI32Op.getIndex();
+  os << ");";
+  return success();
+}
+
+// Process the npu.store_ub_i32 operation:
+// "npu.store_ub_i32"(%28, %31) <{index = 0 : i32}> : (vector<8xi32>, i32) -> ()
+// ->
+// *((__ubuf__ int32_t *)i28 + 0) = i31;
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::StoreUBI32Op storeUBI32Op) {
+  raw_ostream &os = emitter.ostream();
+  os << "*((__ubuf__ int32_t *)";
+  auto dstVectorType = storeUBI32Op.getDstVector().getType();
+  assert(isa<VectorType>(dstVectorType) &&
+         "ICT_ERROR(): store_ub_i32's dst type is not vector type!");
+  os << emitter.getOrCreateName(storeUBI32Op.getDstVector());
+  os << " + ";
+  os << storeUBI32Op.getIndex();
+  os << ") = ";
+  os << emitter.getOrCreateName(storeUBI32Op.getSrcScalar());
+  return success();
+}
+
+// TODO: 这里是暂时这样的，为了让代码先暂时跑起来的暂时措施，真正的应该是：根据npu.alloca_ub_vector去分配内存，然后得到npu.alloca_ub_vector_addr(带地址参数的)，然后转换为get_imm(addr).
+// Process the npu.alloca_ub_vector operation:
+// %28 = "npu.alloca_ub_vector"() <{numElems = 8 : i32}> : () -> vector<8xi32>
+// ->
+// __ubuf__  uint8_t *%28 = (__ubuf__  uint8_t *)get_imm();
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::AllocaUBVectorOp allocaUBVectorOp) {
+  raw_ostream &os = emitter.ostream();
+  os << "__ubuf__  uint8_t *";
+  os << emitter.getOrCreateName(allocaUBVectorOp.getRes());
+  os << " = (__ubuf__  uint8_t *)get_imm();";
+  return success();
+}
+
+// Process the npu.block_id operation:
+// %5 = "npu.block_id"() : () -> i64
+// ->
+// int32_t i0_block_idx = get_block_idx();
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::BlockIdOp blockIdOp) {
+  raw_ostream &os = emitter.ostream();
+  os << "int32_t ";
+  os << emitter.getOrCreateName(blockIdOp.getRes());
+  os << " = get_block_idx();";
+  return success();
+}
+
+// Process the memref.load operation:
+// %55 = memref.load %arg0[%arg4] : memref<?xf32>
+// ->
+// float input_data = (__gm__ float *)gm_input[i_arg4];
+static LogicalResult printMemRefOp(CppEmitter &emitter, memref::LoadOp loadOp) {
+  raw_ostream &os = emitter.ostream();
+  if (failed(emitter.emitAssignPrefix(*loadOp)))
+    return failure();
+  if (failed(emitter.emitType(loadOp.getLoc(), loadOp.getMemRefType())))
+    return failure();
+  os << " ";
+  os << emitter.getOrCreateName(loadOp.getMemRef());
+  os << "[";
+  if (failed(emitter.emitOperand(loadOp.getIndices()[0])))
+    return failure();
+  os << "]";
+  return success();
+}
+
+
+
+
+
+
+static LogicalResult printOperation(CppEmitter &emitter, emitc::LoadOp loadOp) {
+  if (failed(emitter.emitAssignPrefix(*loadOp)))
+    return failure();
+
+  return emitter.emitOperand(loadOp.getOperand());
+}
 
 static LogicalResult printBinaryOperation(CppEmitter &emitter,
                                           Operation *operation,
@@ -711,9 +1171,30 @@ static LogicalResult printBinaryOperation(CppEmitter &emitter,
 
   if (failed(emitter.emitAssignPrefix(*operation)))
     return failure();
-  os << emitter.getOrCreateName(operation->getOperand(0));
-  os << " " << binaryOperator;
-  os << " " << emitter.getOrCreateName(operation->getOperand(1));
+
+  if (failed(emitter.emitOperand(operation->getOperand(0))))
+    return failure();
+
+  os << " " << binaryOperator << " ";
+
+  if (failed(emitter.emitOperand(operation->getOperand(1))))
+    return failure();
+
+  return success();
+}
+
+static LogicalResult printUnaryOperation(CppEmitter &emitter,
+                                         Operation *operation,
+                                         StringRef unaryOperator) {
+  raw_ostream &os = emitter.ostream();
+
+  if (failed(emitter.emitAssignPrefix(*operation)))
+    return failure();
+
+  os << unaryOperator;
+
+  if (failed(emitter.emitOperand(operation->getOperand(0))))
+    return failure();
 
   return success();
 }
@@ -746,6 +1227,46 @@ static LogicalResult printOperation(CppEmitter &emitter, emitc::SubOp subOp) {
   Operation *operation = subOp.getOperation();
 
   return printBinaryOperation(emitter, operation, "-");
+}
+
+static LogicalResult emitSwitchCase(CppEmitter &emitter,
+                                    raw_indented_ostream &os, Region &region) {
+  for (Region::OpIterator iteratorOp = region.op_begin(), end = region.op_end();
+       std::next(iteratorOp) != end; ++iteratorOp) {
+    if (failed(emitter.emitOperation(*iteratorOp, /*trailingSemicolon=*/true)))
+      return failure();
+  }
+  os << "break;\n";
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    emitc::SwitchOp switchOp) {
+  raw_indented_ostream &os = emitter.ostream();
+
+  os << "switch (";
+  if (failed(emitter.emitOperand(switchOp.getArg())))
+    return failure();
+  os << ") {";
+
+  for (auto pair : llvm::zip(switchOp.getCases(), switchOp.getCaseRegions())) {
+    os << "\ncase " << std::get<0>(pair) << ": {\n";
+    os.indent();
+
+    if (failed(emitSwitchCase(emitter, os, std::get<1>(pair))))
+      return failure();
+
+    os.unindent() << "}";
+  }
+
+  os << "\ndefault: {\n";
+  os.indent();
+
+  if (failed(emitSwitchCase(emitter, os, switchOp.getDefaultRegion())))
+    return failure();
+
+  os.unindent() << "}\n}";
+  return success();
 }
 
 static LogicalResult printOperation(CppEmitter &emitter, emitc::CmpOp cmpOp) {
@@ -781,6 +1302,52 @@ static LogicalResult printOperation(CppEmitter &emitter, emitc::CmpOp cmpOp) {
 }
 
 static LogicalResult printOperation(CppEmitter &emitter,
+                                    emitc::ConditionalOp conditionalOp) {
+  raw_ostream &os = emitter.ostream();
+
+  if (failed(emitter.emitAssignPrefix(*conditionalOp)))
+    return failure();
+
+  if (failed(emitter.emitOperand(conditionalOp.getCondition())))
+    return failure();
+
+  os << " ? ";
+
+  if (failed(emitter.emitOperand(conditionalOp.getTrueValue())))
+    return failure();
+
+  os << " : ";
+
+  if (failed(emitter.emitOperand(conditionalOp.getFalseValue())))
+    return failure();
+
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    emitc::VerbatimOp verbatimOp) {
+  raw_ostream &os = emitter.ostream();
+
+  FailureOr<SmallVector<ReplacementItem>> items =
+      verbatimOp.parseFormatString();
+  if (failed(items))
+    return failure();
+
+  auto fmtArg = verbatimOp.getFmtArgs().begin();
+
+  for (ReplacementItem &item : *items) {
+    if (auto *str = std::get_if<StringRef>(&item)) {
+      os << *str;
+    } else {
+      if (failed(emitter.emitOperand(*fmtArg++)))
+        return failure();
+    }
+  }
+
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
                                     cf::BranchOp branchOp) {
   raw_ostream &os = emitter.ostream();
   Block &successor = *branchOp.getSuccessor();
@@ -806,8 +1373,10 @@ static LogicalResult printOperation(CppEmitter &emitter,
   Block &trueSuccessor = *condBranchOp.getTrueDest();
   Block &falseSuccessor = *condBranchOp.getFalseDest();
 
-  os << "if (" << emitter.getOrCreateName(condBranchOp.getCondition())
-     << ") {\n";
+  os << "if (";
+  if (failed(emitter.emitOperand(condBranchOp.getCondition())))
+    return failure();
+  os << ") {\n";
 
   os.indent();
 
@@ -846,37 +1415,52 @@ static LogicalResult printOperation(CppEmitter &emitter,
   return success();
 }
 
-static LogicalResult printOperation(CppEmitter &emitter, func::CallOp callOp) {
-  if (failed(emitter.emitAssignPrefix(*callOp.getOperation())))
+static LogicalResult printCallOperation(CppEmitter &emitter, Operation *callOp,
+                                        StringRef callee) {
+  if (failed(emitter.emitAssignPrefix(*callOp)))
     return failure();
 
   raw_ostream &os = emitter.ostream();
-  os << callOp.getCallee() << "(";
-  if (failed(emitter.emitOperands(*callOp.getOperation())))
+  os << callee << "(";
+  if (failed(emitter.emitOperands(*callOp)))
     return failure();
   os << ")";
   return success();
 }
 
-static LogicalResult printOperation(CppEmitter &emitter, emitc::CallOp callOp) {
+static LogicalResult printOperation(CppEmitter &emitter, func::CallOp callOp) {
+  Operation *operation = callOp.getOperation();
+  StringRef callee = callOp.getCallee();
+
+  return printCallOperation(emitter, operation, callee);
+}
+
+// static LogicalResult printOperation(CppEmitter &emitter, emitc::CallOp callOp) {
+//   Operation *operation = callOp.getOperation();
+//   StringRef callee = callOp.getCallee();
+
+//   return printCallOperation(emitter, operation, callee);
+// }
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    emitc::CallOpaqueOp callOpaqueOp) {
   raw_ostream &os = emitter.ostream();
-  Operation &op = *callOp.getOperation();
+  Operation &op = *callOpaqueOp.getOperation();
 
   if (failed(emitter.emitAssignPrefix(op)))
     return failure();
-  os << callOp.getCallee();
+  os << callOpaqueOp.getCallee();
 
   auto emitArgs = [&](Attribute attr) -> LogicalResult {
     if (auto t = dyn_cast<IntegerAttr>(attr)) {
       // Index attributes are treated specially as operand index.
       if (t.getType().isIndex()) {
         int64_t idx = t.getInt();
-        if ((idx < 0) || (idx >= op.getNumOperands()))
-          return op.emitOpError("invalid operand index");
-        if (!emitter.hasValueInScope(op.getOperand(idx)))
+        Value operand = op.getOperand(idx);
+        if (!emitter.hasValueInScope(operand))
           return op.emitOpError("operand ")
                  << idx << "'s value not defined in scope";
-        os << emitter.getOrCreateName(op.getOperand(idx));
+        os << emitter.getOrCreateName(operand);
         return success();
       }
     }
@@ -886,10 +1470,10 @@ static LogicalResult printOperation(CppEmitter &emitter, emitc::CallOp callOp) {
     return success();
   };
 
-  if (callOp.getTemplateArgs()) {
+  if (callOpaqueOp.getTemplateArgs()) {
     os << "<";
-    if (failed(
-            interleaveCommaWithError(*callOp.getTemplateArgs(), os, emitArgs)))
+    if (failed(interleaveCommaWithError(*callOpaqueOp.getTemplateArgs(), os,
+                                        emitArgs)))
       return failure();
     os << ">";
   }
@@ -897,8 +1481,8 @@ static LogicalResult printOperation(CppEmitter &emitter, emitc::CallOp callOp) {
   os << "(";
 
   LogicalResult emittedArgs =
-      callOp.getArgs()
-          ? interleaveCommaWithError(*callOp.getArgs(), os, emitArgs)
+      callOpaqueOp.getArgs()
+          ? interleaveCommaWithError(*callOpaqueOp.getArgs(), os, emitArgs)
           : emitter.emitOperands(op);
   if (failed(emittedArgs))
     return failure();
@@ -919,6 +1503,56 @@ static LogicalResult printOperation(CppEmitter &emitter,
   return success();
 }
 
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    emitc::BitwiseAndOp bitwiseAndOp) {
+  Operation *operation = bitwiseAndOp.getOperation();
+  return printBinaryOperation(emitter, operation, "&");
+}
+
+static LogicalResult
+printOperation(CppEmitter &emitter,
+               emitc::BitwiseLeftShiftOp bitwiseLeftShiftOp) {
+  Operation *operation = bitwiseLeftShiftOp.getOperation();
+  return printBinaryOperation(emitter, operation, "<<");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    emitc::BitwiseNotOp bitwiseNotOp) {
+  Operation *operation = bitwiseNotOp.getOperation();
+  return printUnaryOperation(emitter, operation, "~");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    emitc::BitwiseOrOp bitwiseOrOp) {
+  Operation *operation = bitwiseOrOp.getOperation();
+  return printBinaryOperation(emitter, operation, "|");
+}
+
+static LogicalResult
+printOperation(CppEmitter &emitter,
+               emitc::BitwiseRightShiftOp bitwiseRightShiftOp) {
+  Operation *operation = bitwiseRightShiftOp.getOperation();
+  return printBinaryOperation(emitter, operation, ">>");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    emitc::BitwiseXorOp bitwiseXorOp) {
+  Operation *operation = bitwiseXorOp.getOperation();
+  return printBinaryOperation(emitter, operation, "^");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    emitc::UnaryPlusOp unaryPlusOp) {
+  Operation *operation = unaryPlusOp.getOperation();
+  return printUnaryOperation(emitter, operation, "+");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    emitc::UnaryMinusOp unaryMinusOp) {
+  Operation *operation = unaryMinusOp.getOperation();
+  return printUnaryOperation(emitter, operation, "-");
+}
+
 static LogicalResult printOperation(CppEmitter &emitter, emitc::CastOp castOp) {
   raw_ostream &os = emitter.ostream();
   Operation &op = *castOp.getOperation();
@@ -929,9 +1563,20 @@ static LogicalResult printOperation(CppEmitter &emitter, emitc::CastOp castOp) {
   if (failed(emitter.emitType(op.getLoc(), op.getResult(0).getType())))
     return failure();
   os << ") ";
-  os << emitter.getOrCreateName(castOp.getOperand());
+  return emitter.emitOperand(castOp.getOperand());
+}
 
-  return success();
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    emitc::ExpressionOp expressionOp) {
+  if (shouldBeInlined(expressionOp))
+    return success();
+
+  Operation &op = *expressionOp.getOperation();
+
+  if (failed(emitter.emitAssignPrefix(op)))
+    return failure();
+
+  return emitter.emitExpression(expressionOp);
 }
 
 static LogicalResult printOperation(CppEmitter &emitter,
@@ -943,6 +1588,81 @@ static LogicalResult printOperation(CppEmitter &emitter,
     os << "<" << includeOp.getInclude() << ">";
   else
     os << "\"" << includeOp.getInclude() << "\"";
+
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    emitc::LogicalAndOp logicalAndOp) {
+  Operation *operation = logicalAndOp.getOperation();
+  return printBinaryOperation(emitter, operation, "&&");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    emitc::LogicalNotOp logicalNotOp) {
+  Operation *operation = logicalNotOp.getOperation();
+  return printUnaryOperation(emitter, operation, "!");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    emitc::LogicalOrOp logicalOrOp) {
+  Operation *operation = logicalOrOp.getOperation();
+  return printBinaryOperation(emitter, operation, "||");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter, emitc::ForOp forOp) {
+
+  raw_indented_ostream &os = emitter.ostream();
+
+  // Utility function to determine whether a value is an expression that will be
+  // inlined, and as such should be wrapped in parentheses in order to guarantee
+  // its precedence and associativity.
+  auto requiresParentheses = [&](Value value) {
+    auto expressionOp =
+        dyn_cast_if_present<ExpressionOp>(value.getDefiningOp());
+    if (!expressionOp)
+      return false;
+    return shouldBeInlined(expressionOp);
+  };
+
+  os << "for (";
+  if (failed(
+          emitter.emitType(forOp.getLoc(), forOp.getInductionVar().getType())))
+    return failure();
+  os << " ";
+  os << emitter.getOrCreateName(forOp.getInductionVar());
+  os << " = ";
+  if (failed(emitter.emitOperand(forOp.getLowerBound())))
+    return failure();
+  os << "; ";
+  os << emitter.getOrCreateName(forOp.getInductionVar());
+  os << " < ";
+  Value upperBound = forOp.getUpperBound();
+  bool upperBoundRequiresParentheses = requiresParentheses(upperBound);
+  if (upperBoundRequiresParentheses)
+    os << "(";
+  if (failed(emitter.emitOperand(upperBound)))
+    return failure();
+  if (upperBoundRequiresParentheses)
+    os << ")";
+  os << "; ";
+  os << emitter.getOrCreateName(forOp.getInductionVar());
+  os << " += ";
+  if (failed(emitter.emitOperand(forOp.getStep())))
+    return failure();
+  os << ") {\n";
+  os.indent();
+
+  Region &forRegion = forOp.getRegion();
+  auto regionOps = forRegion.getOps();
+
+  // We skip the trailing yield op.
+  for (auto it = regionOps.begin(); std::next(it) != regionOps.end(); ++it) {
+    if (failed(emitter.emitOperation(*it, /*trailingSemicolon=*/true)))
+      return failure();
+  }
+
+  os.unindent() << "}";
 
   return success();
 }
@@ -1042,7 +1762,7 @@ static LogicalResult printOperation(CppEmitter &emitter, emitc::IfOp ifOp) {
   };
 
   os << "if (";
-  if (failed(emitter.emitOperands(*ifOp.getOperation())))
+  if (failed(emitter.emitOperand(ifOp.getCondition())))
     return failure();
   os << ") {\n";
   os.indent();
@@ -1097,8 +1817,10 @@ static LogicalResult printOperation(CppEmitter &emitter,
   case 0:
     return success();
   case 1:
-    os << " " << emitter.getOrCreateName(returnOp.getOperand(0));
-    return success(emitter.hasValueInScope(returnOp.getOperand(0)));
+    os << " ";
+    if (failed(emitter.emitOperand(returnOp.getOperand(0))))
+      return failure();
+    return success();
   default:
     os << " std::make_tuple(";
     if (failed(emitter.emitOperandsAndAttributes(*returnOp.getOperation())))
@@ -1108,6 +1830,19 @@ static LogicalResult printOperation(CppEmitter &emitter,
   }
 }
 
+// static LogicalResult printOperation(CppEmitter &emitter,
+//                                     emitc::ReturnOp returnOp) {
+//   raw_ostream &os = emitter.ostream();
+//   os << "return";
+//   if (returnOp.getNumOperands() == 0)
+//     return success();
+
+//   os << " ";
+//   if (failed(emitter.emitOperand(returnOp.getOperand())))
+//     return failure();
+//   return success();
+// }
+
 static LogicalResult printOperation(CppEmitter &emitter, ModuleOp moduleOp) {
   CppEmitter::Scope scope(emitter);
 
@@ -1115,6 +1850,109 @@ static LogicalResult printOperation(CppEmitter &emitter, ModuleOp moduleOp) {
     if (failed(emitter.emitOperation(op, /*trailingSemicolon=*/false)))
       return failure();
   }
+  return success();
+}
+
+// static LogicalResult printOperation(CppEmitter &emitter, FileOp file) {
+//   if (!emitter.shouldEmitFile(file))
+//     return success();
+
+//   CppEmitter::Scope scope(emitter);
+
+//   for (Operation &op : file) {
+//     if (failed(emitter.emitOperation(op, /*trailingSemicolon=*/false)))
+//       return failure();
+//   }
+//   return success();
+// }
+
+static LogicalResult printFunctionArgs(CppEmitter &emitter,
+                                       Operation *functionOp,
+                                       ArrayRef<Type> arguments) {
+  raw_indented_ostream &os = emitter.ostream();
+
+  return (
+      interleaveCommaWithError(arguments, os, [&](Type arg) -> LogicalResult {
+        return emitter.emitType(functionOp->getLoc(), arg);
+      }));
+}
+
+static LogicalResult printFunctionArgs(CppEmitter &emitter,
+                                       Operation *functionOp,
+                                       Region::BlockArgListType arguments) {
+  raw_indented_ostream &os = emitter.ostream();
+
+  return (interleaveCommaWithError(
+      arguments, os, [&](BlockArgument arg) -> LogicalResult {
+        return emitter.emitVariableDeclaration(
+            functionOp->getLoc(), arg.getType(), emitter.getOrCreateName(arg));
+      }));
+}
+
+static LogicalResult printFunctionBody(CppEmitter &emitter,
+                                       Operation *functionOp,
+                                       Region::BlockListType &blocks) {
+  raw_indented_ostream &os = emitter.ostream();
+  os.indent();
+
+  if (emitter.shouldDeclareVariablesAtTop()) {
+    // Declare all variables that hold op results including those from nested
+    // regions.
+    WalkResult result =
+        functionOp->walk<WalkOrder::PreOrder>([&](Operation *op) -> WalkResult {
+          if (isa<emitc::ExpressionOp>(op->getParentOp()) ||
+              (isa<emitc::ExpressionOp>(op) &&
+               shouldBeInlined(cast<emitc::ExpressionOp>(op))))
+            return WalkResult::skip();
+          for (OpResult result : op->getResults()) {
+            if (failed(emitter.emitVariableDeclaration(
+                    result, /*trailingSemicolon=*/true))) {
+              return WalkResult(
+                  op->emitError("unable to declare result variable for op"));
+            }
+          }
+          return WalkResult::advance();
+        });
+    if (result.wasInterrupted())
+      return failure();
+  }
+
+  // Create label names for basic blocks.
+  for (Block &block : blocks) {
+    emitter.getOrCreateName(block);
+  }
+
+  // Declare variables for basic block arguments.
+  for (Block &block : llvm::drop_begin(blocks)) {
+    for (BlockArgument &arg : block.getArguments()) {
+      if (emitter.hasValueInScope(arg))
+        return functionOp->emitOpError(" block argument #")
+               << arg.getArgNumber() << " is out of scope";
+      if (isa<ArrayType, LValueType>(arg.getType()))
+        return functionOp->emitOpError("cannot emit block argument #")
+               << arg.getArgNumber() << " with type " << arg.getType();
+      if (failed(
+              emitter.emitType(block.getParentOp()->getLoc(), arg.getType()))) {
+        return failure();
+      }
+      os << " " << emitter.getOrCreateName(arg) << ";\n";
+    }
+  }
+
+  for (Block &block : blocks) {
+    // Only print a label if the block has predecessors.
+    if (!block.hasNoPredecessors()) {
+      if (failed(emitter.emitLabel(block)))
+        return failure();
+    }
+    for (Operation &op : block.getOperations()) {
+      if (failed(emitter.emitOperation(op, /*trailingSemicolon=*/true)))
+        return failure();
+    }
+  }
+
+  os.unindent();
+
   return success();
 }
 
@@ -1144,6 +1982,15 @@ static LogicalResult printOperation(CppEmitter &emitter,
         "with multiple blocks needs variables declared at top");
   }
 
+  // if (llvm::any_of(functionOp.getArgumentTypes(), llvm::IsaPred<LValueType>)) {
+  //   return functionOp.emitOpError()
+  //          << "cannot emit lvalue type as argument type";
+  // }
+
+  // if (llvm::any_of(functionOp.getResultTypes(), llvm::IsaPred<ArrayType>)) {
+  //   return functionOp.emitOpError() << "cannot emit array type as result type";
+  // }
+
   CppEmitter::Scope scope(emitter);
   raw_indented_ostream &os = emitter.ostream();
   if (failed(emitter.emitTypes(functionOp.getLoc(),
@@ -1152,75 +1999,14 @@ static LogicalResult printOperation(CppEmitter &emitter,
   os << " " << functionOp.getName();
 
   os << "(";
-  if (failed(interleaveCommaWithError(
-          functionOp.getArguments(), os,
-          [&](BlockArgument arg) -> LogicalResult {
-            if (failed(emitter.emitType(functionOp.getLoc(), arg.getType())))
-              return failure();
-            os << " " << emitter.getOrCreateName(arg);
-            return success();
-          })))
+  Operation *operation = functionOp.getOperation();
+  if (failed(printFunctionArgs(emitter, operation, functionOp.getArguments())))
     return failure();
   os << ") {\n";
-  os.indent();
-  if (emitter.shouldDeclareVariablesAtTop()) {
-    // Declare all variables that hold op results including those from nested
-    // regions.
-    WalkResult result =
-        functionOp.walk<WalkOrder::PreOrder>([&](Operation *op) -> WalkResult {
-          for (OpResult result : op->getResults()) {
-            if (failed(emitter.emitVariableDeclaration(
-                    result, /*trailingSemicolon=*/true))) {
-              return WalkResult(
-                  op->emitError("unable to declare result variable for op"));
-            }
-          }
-          return WalkResult::advance();
-        });
-    if (result.wasInterrupted())
-      return failure();
-  }
+  if (failed(printFunctionBody(emitter, operation, functionOp.getBlocks())))
+    return failure();
+  os << "}\n";
 
-  Region::BlockListType &blocks = functionOp.getBlocks();
-  // Create label names for basic blocks.
-  for (Block &block : blocks) {
-    emitter.getOrCreateName(block);
-  }
-
-  // Declare variables for basic block arguments.
-  for (Block &block : llvm::drop_begin(blocks)) {
-    for (BlockArgument &arg : block.getArguments()) {
-      if (emitter.hasValueInScope(arg))
-        return functionOp.emitOpError(" block argument #")
-               << arg.getArgNumber() << " is out of scope";
-      if (failed(
-              emitter.emitType(block.getParentOp()->getLoc(), arg.getType()))) {
-        return failure();
-      }
-      os << " " << emitter.getOrCreateName(arg) << ";\n";
-    }
-  }
-
-  for (Block &block : blocks) {
-    // Only print a label if the block has predecessors.
-    if (!block.hasNoPredecessors()) {
-      if (failed(emitter.emitLabel(block)))
-        return failure();
-    }
-    for (Operation &op : block.getOperations()) {
-      // When generating code for an emitc.if or cf.cond_br op no semicolon
-      // needs to be printed after the closing brace.
-      // When generating code for an scf.for op, printing a trailing semicolon
-      // is handled within the printOperation function.
-      bool trailingSemicolon =
-          !isa<cf::CondBranchOp, emitc::LiteralOp, emitc::IfOp, scf::ForOp>(op);
-
-      if (failed(emitter.emitOperation(
-              op, /*trailingSemicolon=*/trailingSemicolon)))
-        return failure();
-    }
-  }
-  os.unindent() << "}\n";
   return success();
 }
 
@@ -1368,8 +2154,9 @@ static LogicalResult printOperation(CppEmitter &emitter,
       // needs to be printed after the closing brace.
       // When generating code for an scf.for op, printing a trailing semicolon
       // is handled within the printOperation function.
+      // TODO: 这里需要加emitc::ForOp吗？似乎应该？
       bool trailingSemicolon =
-          !isa<cf::CondBranchOp, emitc::LiteralOp, emitc::IfOp, scf::ForOp>(op);
+          !isa<cf::CondBranchOp, emitc::LiteralOp, emitc::IfOp, scf::ForOp, emitc::ForOp>(op);
 
       if (failed(emitter.emitOperation(
               op, /*trailingSemicolon=*/trailingSemicolon)))
@@ -1380,18 +2167,125 @@ static LogicalResult printOperation(CppEmitter &emitter,
   return success();
 }
 
-CppEmitter::CppEmitter(raw_ostream &os, bool declareVariablesAtTop)
-    : os(os), declareVariablesAtTop(declareVariablesAtTop) {
+// static LogicalResult printOperation(CppEmitter &emitter,
+//                                     emitc::FuncOp functionOp) {
+//   // We need to declare variables at top if the function has multiple blocks.
+//   if (!emitter.shouldDeclareVariablesAtTop() &&
+//       functionOp.getBlocks().size() > 1) {
+//     return functionOp.emitOpError(
+//         "with multiple blocks needs variables declared at top");
+//   }
+
+//   CppEmitter::Scope scope(emitter);
+//   raw_indented_ostream &os = emitter.ostream();
+//   if (functionOp.getSpecifiers()) {
+//     for (Attribute specifier : functionOp.getSpecifiersAttr()) {
+//       os << cast<StringAttr>(specifier).str() << " ";
+//     }
+//   }
+
+//   if (failed(emitter.emitTypes(functionOp.getLoc(),
+//                                functionOp.getFunctionType().getResults())))
+//     return failure();
+//   os << " " << functionOp.getName();
+
+//   os << "(";
+//   Operation *operation = functionOp.getOperation();
+//   if (functionOp.isExternal()) {
+//     if (failed(printFunctionArgs(emitter, operation,
+//                                  functionOp.getArgumentTypes())))
+//       return failure();
+//     os << ");";
+//     return success();
+//   }
+//   if (failed(printFunctionArgs(emitter, operation, functionOp.getArguments())))
+//     return failure();
+//   os << ") {\n";
+//   if (failed(printFunctionBody(emitter, operation, functionOp.getBlocks())))
+//     return failure();
+//   os << "}\n";
+
+//   return success();
+// }
+
+// static LogicalResult printOperation(CppEmitter &emitter,
+//                                     DeclareFuncOp declareFuncOp) {
+//   CppEmitter::Scope scope(emitter);
+//   raw_indented_ostream &os = emitter.ostream();
+
+//   auto functionOp = SymbolTable::lookupNearestSymbolFrom<emitc::FuncOp>(
+//       declareFuncOp, declareFuncOp.getSymNameAttr());
+
+//   if (!functionOp)
+//     return failure();
+
+//   if (functionOp.getSpecifiers()) {
+//     for (Attribute specifier : functionOp.getSpecifiersAttr()) {
+//       os << cast<StringAttr>(specifier).str() << " ";
+//     }
+//   }
+
+//   if (failed(emitter.emitTypes(functionOp.getLoc(),
+//                                functionOp.getFunctionType().getResults())))
+//     return failure();
+//   os << " " << functionOp.getName();
+
+//   os << "(";
+//   Operation *operation = functionOp.getOperation();
+//   if (failed(printFunctionArgs(emitter, operation, functionOp.getArguments())))
+//     return failure();
+//   os << ");";
+
+//   return success();
+// }
+
+CppEmitter::CppEmitter(raw_ostream &os, bool declareVariablesAtTop/*,
+                       StringRef fileId*/)
+    : os(os), declareVariablesAtTop(declareVariablesAtTop)/*,
+      fileId(fileId.str())*/ {
   valueInScopeCount.push(0);
   labelInScopeCount.push(0);
 }
 
+std::string CppEmitter::getSubscriptName(emitc::SubscriptOp op) {
+  std::string out;
+  llvm::raw_string_ostream ss(out);
+  ss << getOrCreateName(op.getValue());
+  for (auto index : op.getIndices()) {
+    ss << "[" << getOrCreateName(index) << "]";
+  }
+  return out;
+}
+
+std::string CppEmitter::createMemberAccess(emitc::MemberOp op) {
+  std::string out;
+  llvm::raw_string_ostream ss(out);
+  ss << getOrCreateName(op.getOperand());
+  ss << "." << op.getMember();
+  return out;
+}
+
+std::string CppEmitter::createMemberAccess(emitc::MemberOfPtrOp op) {
+  std::string out;
+  llvm::raw_string_ostream ss(out);
+  ss << getOrCreateName(op.getOperand());
+  ss << "->" << op.getMember();
+  return out;
+}
+
+void CppEmitter::cacheDeferredOpResult(Value value, StringRef str) {
+  if (!valueMapper.count(value))
+    valueMapper.insert(value, str.str());
+}
+
 /// Return the existing or a new name for a Value.
 StringRef CppEmitter::getOrCreateName(Value val) {
-  if (auto literal = dyn_cast_if_present<emitc::LiteralOp>(val.getDefiningOp()))
-    return literal.getValue();
-  if (!valueMapper.count(val))
+  if (!valueMapper.count(val)) {
+    assert(!hasDeferredEmission(val.getDefiningOp()) &&
+           "cacheDeferredOpResult should have been called on this value, "
+           "update the emitOperation function.");
     valueMapper.insert(val, formatv("v{0}", ++valueInScopeCount.top()));
+  }
   return *valueMapper.begin(val);
 }
 
@@ -1439,17 +2333,22 @@ LogicalResult CppEmitter::emitAttribute(Location loc, Attribute attr) {
       SmallString<128> strValue;
       // Use default values of toString except don't truncate zeros.
       val.toString(strValue, 0, 0, false);
+      os << strValue;
       switch (llvm::APFloatBase::SemanticsToEnum(val.getSemantics())) {
+      case llvm::APFloatBase::S_IEEEhalf:
+        os << "f16";
+        break;
+      case llvm::APFloatBase::S_BFloat:
+        os << "bf16";
+        break;
       case llvm::APFloatBase::S_IEEEsingle:
-        os << "(float)";
+        os << "f";
         break;
       case llvm::APFloatBase::S_IEEEdouble:
-        os << "(double)";
         break;
       default:
-        break;
+        llvm_unreachable("unsupported floating point type");
       };
-      os << strValue;
     } else if (val.isNaN()) {
       os << "NAN";
     } else if (val.isInfinity()) {
@@ -1461,10 +2360,20 @@ LogicalResult CppEmitter::emitAttribute(Location loc, Attribute attr) {
 
   // Print floating point attributes.
   if (auto fAttr = dyn_cast<FloatAttr>(attr)) {
+    if (!isa<Float16Type, BFloat16Type, Float32Type, Float64Type>(
+            fAttr.getType())) {
+      return emitError(
+          loc, "expected floating point attribute to be f16, bf16, f32 or f64");
+    }
     printFloat(fAttr.getValue());
     return success();
   }
   if (auto dense = dyn_cast<DenseFPElementsAttr>(attr)) {
+    if (!isa<Float16Type, BFloat16Type, Float32Type, Float64Type>(
+            dense.getElementType())) {
+      return emitError(
+          loc, "expected floating point attribute to be f16, bf16, f32 or f64");
+    }
     os << '{';
     interleaveComma(dense, os, [&](const APFloat &val) { printFloat(val); });
     os << '}';
@@ -1523,14 +2432,74 @@ LogicalResult CppEmitter::emitAttribute(Location loc, Attribute attr) {
   return emitError(loc, "cannot emit attribute: ") << attr;
 }
 
-LogicalResult CppEmitter::emitOperands(Operation &op) {
-  auto emitOperandName = [&](Value result) -> LogicalResult {
-    if (!hasValueInScope(result))
-      return op.emitOpError() << "operand value not in scope";
-    os << getOrCreateName(result);
+LogicalResult CppEmitter::emitExpression(ExpressionOp expressionOp) {
+  assert(emittedExpressionPrecedence.empty() &&
+         "Expected precedence stack to be empty");
+  Operation *rootOp = expressionOp.getRootOp();
+
+  emittedExpression = expressionOp;
+  FailureOr<int> precedence = getOperatorPrecedence(rootOp);
+  if (failed(precedence))
+    return failure();
+  pushExpressionPrecedence(precedence.value());
+
+  if (failed(emitOperation(*rootOp, /*trailingSemicolon=*/false)))
+    return failure();
+
+  popExpressionPrecedence();
+  assert(emittedExpressionPrecedence.empty() &&
+         "Expected precedence stack to be empty");
+  emittedExpression = nullptr;
+
+  return success();
+}
+
+LogicalResult CppEmitter::emitOperand(Value value) {
+  if (isPartOfCurrentExpression(value)) {
+    Operation *def = value.getDefiningOp();
+    assert(def && "Expected operand to be defined by an operation");
+    FailureOr<int> precedence = getOperatorPrecedence(def);
+    if (failed(precedence))
+      return failure();
+
+    // Sub-expressions with equal or lower precedence need to be parenthesized,
+    // as they might be evaluated in the wrong order depending on the shape of
+    // the expression tree.
+    bool encloseInParenthesis = precedence.value() <= getExpressionPrecedence();
+    if (encloseInParenthesis)
+      os << "(";
+    pushExpressionPrecedence(precedence.value());
+
+    if (failed(emitOperation(*def, /*trailingSemicolon=*/false)))
+      return failure();
+
+    if (encloseInParenthesis)
+      os << ")";
+
+    popExpressionPrecedence();
     return success();
-  };
-  return interleaveCommaWithError(op.getOperands(), os, emitOperandName);
+  }
+
+  auto expressionOp = dyn_cast_if_present<ExpressionOp>(value.getDefiningOp());
+  if (expressionOp && shouldBeInlined(expressionOp))
+    return emitExpression(expressionOp);
+
+  os << getOrCreateName(value);
+  return success();
+}
+
+LogicalResult CppEmitter::emitOperands(Operation &op) {
+  return interleaveCommaWithError(op.getOperands(), os, [&](Value operand) {
+    // If an expression is being emitted, push lowest precedence as these
+    // operands are either wrapped by parenthesis.
+    if (getEmittedExpression())
+      pushExpressionPrecedence(lowestPrecedence());
+    if (failed(emitOperand(operand)))
+      return failure();
+    if (getEmittedExpression())
+      popExpressionPrecedence();
+    return success();
+  });
 }
 
 LogicalResult CppEmitter::emitAddLikeOperands(Operation &op) {
@@ -1580,19 +2549,50 @@ LogicalResult CppEmitter::emitVariableAssignment(OpResult result) {
 
 LogicalResult CppEmitter::emitVariableDeclaration(OpResult result,
                                                   bool trailingSemicolon) {
+  if (hasDeferredEmission(result.getDefiningOp()))
+    return success();
   if (hasValueInScope(result)) {
     return result.getDefiningOp()->emitError(
         "result variable for the operation already declared");
   }
-  if (failed(emitType(result.getOwner()->getLoc(), result.getType())))
+  if (failed(emitVariableDeclaration(result.getOwner()->getLoc(),
+                                     result.getType(),
+                                     getOrCreateName(result))))
     return failure();
-  os << " " << getOrCreateName(result);
   if (trailingSemicolon)
     os << ";\n";
   return success();
 }
 
+LogicalResult CppEmitter::emitGlobalVariable(GlobalOp op) {
+  if (op.getExternSpecifier())
+    os << "extern ";
+  else if (op.getStaticSpecifier())
+    os << "static ";
+  if (op.getConstSpecifier())
+    os << "const ";
+
+  if (failed(emitVariableDeclaration(op->getLoc(), op.getType(),
+                                     op.getSymName()))) {
+    return failure();
+  }
+
+  std::optional<Attribute> initialValue = op.getInitialValue();
+  if (initialValue) {
+    os << " = ";
+    if (failed(emitAttribute(op->getLoc(), *initialValue)))
+      return failure();
+  }
+
+  os << ";";
+  return success();
+}
+
 LogicalResult CppEmitter::emitAssignPrefix(Operation &op) {
+  // If op is being emitted as part of an expression, bail out.
+  if (getEmittedExpression())
+    return success();
+
   switch (op.getNumResults()) {
   case 0:
     break;
@@ -1641,21 +2641,34 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
           .Case<cf::BranchOp, cf::CondBranchOp>(
               [&](auto op) { return printOperation(*this, op); })
           // EmitC ops.
-          .Case<emitc::AddOp, emitc::ApplyOp, emitc::AssignOp, emitc::CallOp,
-                emitc::CastOp, emitc::CmpOp, emitc::ConstantOp, emitc::DivOp,
-                emitc::IfOp, emitc::IncludeOp, emitc::MulOp, emitc::RemOp,
-                emitc::SubOp, emitc::VariableOp>(
+          .Case<emitc::AddOp, emitc::ApplyOp, emitc::AssignOp,
+                emitc::BitwiseAndOp, emitc::BitwiseLeftShiftOp,
+                emitc::BitwiseNotOp, emitc::BitwiseOrOp,
+                emitc::BitwiseRightShiftOp, emitc::BitwiseXorOp, /*emitc::CallOp,*/
+                emitc::CallOpaqueOp, emitc::CastOp, emitc::CmpOp,
+                emitc::ConditionalOp, emitc::ConstantOp, /*emitc::DeclareFuncOp,*/
+                emitc::DivOp, emitc::ExpressionOp, /*emitc::FileOp,*/ emitc::ForOp,
+                /*emitc::FuncOp,*/ emitc::GlobalOp, emitc::IfOp, emitc::IncludeOp,
+                emitc::LoadOp, emitc::LogicalAndOp, emitc::LogicalNotOp,
+                emitc::LogicalOrOp, emitc::MulOp, emitc::RemOp, /*emitc::ReturnOp,*/
+                emitc::SubOp, emitc::SwitchOp, emitc::UnaryMinusOp,
+                emitc::UnaryPlusOp, emitc::VariableOp, emitc::VerbatimOp>(
+
               [&](auto op) { return printOperation(*this, op); })
           // Func ops.
-          .Case<func::CallOp, func::ConstantOp, func::FuncOp, func::ReturnOp>(
+          .Case<func::CallOp, func::FuncOp, func::ReturnOp>(
               [&](auto op) { return printOperation(*this, op); })
           // SCF ops.
           .Case<scf::ForOp, scf::YieldOp>(
               [&](auto op) { return printOperation(*this, op); })
-          // Arithmetic ops.
-          .Case<arith::ConstantOp>(
-              [&](auto op) { return printOperation(*this, op); })
-          .Case<emitc::LiteralOp>([&](auto op) { return success(); })
+          .Case<emitc::GetGlobalOp>([&](auto op) {
+            cacheDeferredOpResult(op.getResult(), op.getName());
+            return success();
+          })
+          .Case<emitc::LiteralOp>([&](auto op) {
+            cacheDeferredOpResult(op.getResult(), op.getValue());
+            return success();
+          })
           // GPU ops.
           .Case<gpu::GPUModuleOp, gpu::GPUFuncOp, gpu::ReturnOp,
                 gpu::ModuleEndOp>(
@@ -1664,11 +2677,33 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
           .Case<UnrealizedConversionCastOp>([&](auto op) {
             return printBuiltinUnrealizedConversionOp(*this, op);
           })
+          // MemRef ops.
+          .Case<memref::LoadOp>([&](auto op) {
+            return printMemRefOp(*this, op);
+          })
           // LLVM ops.
           .Case<LLVM::GEPOp>([&](auto op) { return printLLVMGEPOp(*this, op); })
           // NPU ops.
-          .Case<npu::MovOutToUBOp, npu::MovUBToOutOp, npu::VAddF32Op>(
+          .Case<npu::MovOutToUBOp, npu::MovUBToOutOp, 
+                npu::VAddF32Op, npu::VAddI32Op, npu::VMulF32Op,
+                npu::VCmpI32Op, npu::VSelOp, npu::AtomicAddF32Op,
+                npu::BroadCastI32Op, npu::MOVEVF32Op, npu::AssignUBI32Op, 
+                npu::LoadUBI32Op, npu::StoreUBI32Op, 
+                npu::AllocaUBVectorOp, 
+                npu::BlockIdOp>(
               [&](auto op) { return printNPUOp(*this, op); })
+          .Case<emitc::MemberOp>([&](auto op) {
+            cacheDeferredOpResult(op.getResult(), createMemberAccess(op));
+            return success();
+          })
+          .Case<emitc::MemberOfPtrOp>([&](auto op) {
+            cacheDeferredOpResult(op.getResult(), createMemberAccess(op));
+            return success();
+          })
+          .Case<emitc::SubscriptOp>([&](auto op) {
+            cacheDeferredOpResult(op.getResult(), getSubscriptName(op));
+            return success();
+          })
           .Default([&](Operation *) {
             return op.emitOpError("unable to find printer for op");
           });
@@ -1676,10 +2711,40 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
   if (failed(status))
     return failure();
 
-  if (isa<emitc::LiteralOp>(op))
+  if (hasDeferredEmission(&op))
     return success();
 
+  if (getEmittedExpression() ||
+      (isa<emitc::ExpressionOp>(op) &&
+       shouldBeInlined(cast<emitc::ExpressionOp>(op))))
+    return success();
+
+  // Never emit a semicolon for some operations, especially if endening with
+  // `}`.
+  trailingSemicolon &=
+      !isa<cf::CondBranchOp, /*emitc::DeclareFuncOp,*/ /*emitc::FileOp,*/ emitc::ForOp,
+           emitc::IfOp, emitc::IncludeOp, emitc::SwitchOp, emitc::VerbatimOp>(
+          op);
+
   os << (trailingSemicolon ? ";\n" : "\n");
+
+  return success();
+}
+
+LogicalResult CppEmitter::emitVariableDeclaration(Location loc, Type type,
+                                                  StringRef name) {
+  if (auto arrType = dyn_cast<emitc::ArrayType>(type)) {
+    if (failed(emitType(loc, arrType.getElementType())))
+      return failure();
+    os << " " << name;
+    for (auto dim : arrType.getShape()) {
+      os << "[" << dim << "]";
+    }
+    return success();
+  }
+  if (failed(emitType(loc, type)))
+    return failure();
+  os << " " << name;
   return success();
 }
 
@@ -1702,6 +2767,14 @@ LogicalResult CppEmitter::emitType(Location loc, Type type) {
   }
   if (auto fType = dyn_cast<FloatType>(type)) {
     switch (fType.getWidth()) {
+    case 16: {
+      if (llvm::isa<Float16Type>(type))
+        return (os << "_Float16"), success();
+      else if (llvm::isa<BFloat16Type>(type))
+        return (os << "__bf16"), success();
+      else
+        return emitError(loc, "cannot emit float type ") << type;
+    }
     case 32:
       return (os << "float"), success();
     case 64:
@@ -1711,13 +2784,22 @@ LogicalResult CppEmitter::emitType(Location loc, Type type) {
     }
   }
   if (auto iType = dyn_cast<IndexType>(type))
+    // TODO:: 把index 翻译为size_t，正确吗？index是signless的，size_t是unsigned的
     return (os << "size_t"), success();
+  if (auto sType = dyn_cast<emitc::SizeTType>(type))
+    return (os << "size_t"), success();
+  if (auto sType = dyn_cast<emitc::SignedSizeTType>(type))
+    return (os << "ssize_t"), success();
+  if (auto pType = dyn_cast<emitc::PtrDiffTType>(type))
+    return (os << "ptrdiff_t"), success();
   if (auto tType = dyn_cast<TensorType>(type)) {
     if (!tType.hasRank())
       return emitError(loc, "cannot emit unranked tensor type");
     if (!tType.hasStaticShape())
       return emitError(loc, "cannot emit tensor type with non static shape");
     os << "Tensor<";
+    if (isa<ArrayType>(tType.getElementType()))
+      return emitError(loc, "cannot emit tensor of array type ") << type;
     if (failed(emitType(loc, tType.getElementType())))
       return failure();
     auto shape = tType.getShape();
@@ -1734,7 +2816,18 @@ LogicalResult CppEmitter::emitType(Location loc, Type type) {
     os << oType.getValue();
     return success();
   }
+  if (auto aType = dyn_cast<emitc::ArrayType>(type)) {
+    if (failed(emitType(loc, aType.getElementType())))
+      return failure();
+    for (auto dim : aType.getShape())
+      os << "[" << dim << "]";
+    return success();
+  }
+  if (auto lType = dyn_cast<emitc::LValueType>(type))
+    return emitType(loc, lType.getValueType());
   if (auto pType = dyn_cast<emitc::PointerType>(type)) {
+    if (isa<ArrayType>(pType.getPointee()))
+      return emitError(loc, "cannot emit pointer to array type ") << type;
     if (failed(emitType(loc, pType.getPointee())))
       return failure();
     os << "*";
@@ -1742,7 +2835,8 @@ LogicalResult CppEmitter::emitType(Location loc, Type type) {
   }
   if (auto memrefType = dyn_cast<MemRefType>(type)) {
     // Emit memory space.
-    if (memrefType.getMemorySpaceAsInt() == 1) {
+    // TODO: MemRefType space == 1是啥情况？在哪里设置的？我没啥印象了，emmm
+    if (memrefType.getMemorySpaceAsInt() == 1 || memrefType.getMemorySpaceAsInt() == 0) {
 #ifdef GEN_BISHENGCPP_CODE
       os << "__global ";
 #else
@@ -1806,6 +2900,15 @@ LogicalResult CppEmitter::emitType(Location loc, Type type) {
     os << "*";
     return success();
   }
+  // process vector<Nxf32> type
+  if (auto vecType = dyn_cast<VectorType>(type)) {
+    auto elemType = vecType.getElementType();  // vector's element type, such as float
+    os << "__ubuf__ ";    // vector variables must be in ubuf
+    if(failed(emitType(loc, elemType)))   // such as os << "float";
+      return failure();
+    os << "*";
+    return success();
+  }
   return emitError(loc, "cannot emit type ") << type;
 }
 
@@ -1822,6 +2925,9 @@ LogicalResult CppEmitter::emitTypes(Location loc, ArrayRef<Type> types) {
 }
 
 LogicalResult CppEmitter::emitTupleType(Location loc, ArrayRef<Type> types) {
+  // if (llvm::any_of(types, llvm::IsaPred<ArrayType>)) {
+  //   return emitError(loc, "cannot emit tuple of array type");
+  // }
   os << "std::tuple<";
   if (failed(interleaveCommaWithError(
           types, os, [&](Type type) { return emitType(loc, type); })))
@@ -1831,7 +2937,8 @@ LogicalResult CppEmitter::emitTupleType(Location loc, ArrayRef<Type> types) {
 }
 
 LogicalResult emitc::translateToCpp(Operation *op, raw_ostream &os,
-                                    bool declareVariablesAtTop) {
-  CppEmitter emitter(os, declareVariablesAtTop);
+                                    bool declareVariablesAtTop/*,
+                                    StringRef fileId*/) {
+  CppEmitter emitter(os, declareVariablesAtTop/*, fileId*/);
   return emitter.emitOperation(*op, /*trailingSemicolon=*/false);
 }

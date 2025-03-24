@@ -7,6 +7,8 @@
 #ifndef NPU_DIALECT
 #define NPU_DIALECT
 
+include "mlir/IR/BuiltinAttributeInterfaces.td"
+include "mlir/IR/EnumAttr.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Dialect/LLVMIR/LLVMOpBase.td"
@@ -22,10 +24,42 @@ def NPU_Dialect : Dialect {
 class NPU_Op<string mnemonic, list<Trait> traits = []> 
   : Op<NPU_Dialect, mnemonic, traits>;
 
+def NPUCmpIPredicateAttr : I64EnumAttr<
+    "NPUCmpIPredicate", "",
+    [
+      I64EnumAttrCase<"eq", 0>,
+      I64EnumAttrCase<"ne", 1>,
+      I64EnumAttrCase<"slt", 2>,
+      I64EnumAttrCase<"sle", 3>,
+      I64EnumAttrCase<"sgt", 4>,
+      I64EnumAttrCase<"sge", 5>,
+      I64EnumAttrCase<"ult", 6>,
+      I64EnumAttrCase<"ule", 7>,
+      I64EnumAttrCase<"ugt", 8>,
+      I64EnumAttrCase<"uge", 9>,
+    ]> {
+  let cppNamespace = "::mlir::npu";
+}
+
+/*************** Binary operations ***************/
 def VAddF32Op : NPU_Op<"vadd", [Pure]> {
   let summary = "Vector add operation";
   let description = [{
     The `vadd` operation adds two vectors element-wise.
+  }];
+
+  let arguments = (ins AnyVector:$lhs, AnyVector:$rhs, I32Attr:$numElems);
+  let results = (outs AnyVector:$res);
+
+  let builders = [
+    OpBuilder<(ins "Value":$lhs, "Value":$rhs, "IntegerAttr":$numElems)>
+  ];
+}
+
+def VAddI32Op : NPU_Op<"vadd_i32", [Pure]> {
+  let summary = "Vector int32 add operation";
+  let description = [{
+    The `vadd_i32` operation adds two int32 vectors element-wise.
   }];
 
   let arguments = (ins AnyVector:$lhs, AnyVector:$rhs, I32Attr:$numElems);
@@ -78,6 +112,51 @@ def VDivF32Op : NPU_Op<"vdiv_f32", [Pure]> {
   ];
 }
 
+def VDivI32Op : NPU_Op<"vdiv_i32", [Pure]> {
+  let summary = "Vector int32 div operation";
+  let description = [{
+    The `vdiv_i32` operation divs two int32 vectors element-wise.
+  }];
+
+  let arguments = (ins AnyVector:$lhs, AnyVector:$rhs, I32Attr:$numElems);
+  let results = (outs AnyVector:$res);
+
+  let builders = [
+    OpBuilder<(ins "Value":$lhs, "Value":$rhs, "IntegerAttr":$numElems)>
+  ];
+}
+
+def VCmpI32Op : NPU_Op<"vcmp_i32", [Pure]> {
+  let summary = "Vector int32 compare operation";
+  let description = [{
+    The `vcmp_i32` operation compares two vectors element-wise, 
+    return result vector, which is a mask vector. 
+    Input: predicate, i32 vector, i32 vector.
+    Output: i1 vector.
+  }];
+
+  let arguments = (ins NPUCmpIPredicateAttr:$predicate, 
+                       AnyVector:$lhs, 
+                       AnyVector:$rhs);
+  let results = (outs AnyVector:$res);
+}
+
+/*************** Ternary operations ***************/
+def VSelOp : NPU_Op<"vsel", [Pure]> {
+  let summary = "Vector select operation";
+  let description = [{
+    The `vsel` operation selects elements from two vectors based on a mask vector.
+  }];
+
+  let arguments = (ins AnyVector:$mask, AnyVector:$lhs, AnyVector:$rhs, I32Attr:$numElems);
+  let results = (outs AnyVector:$res);
+
+  let builders = [
+    OpBuilder<(ins "Value":$mask, "Value":$lhs, "Value":$rhs, "IntegerAttr":$numElems)>
+  ];
+}
+
+/*************** Unary operations ***************/
 def VExpF32Op : NPU_Op<"vexp_f32", [Pure]> {
   let summary = "Vector float32 exp operation";
   let description = [{
@@ -192,6 +271,50 @@ def VTanhF32Op : NPU_Op<"vtanh_f32", [Pure]> {
   ];
 }
 
+def ConstantI32ScalarVectorOp : NPU_Op<"constant_i32_scalar_vector", [Pure]> {
+  let summary = "Create a constant i32 vector from a scalar value";
+  let description = [{
+    The `constant_i32_scalar_vector` operation creates a constant i32 vector 
+    from a scalar value.
+  }];
+
+  let arguments = (ins I32Attr:$value, I32Attr:$numElems);
+  let results = (outs VectorOf<[I32]>:$res);
+}
+
+def ConstantF32ScalarVectorOp : NPU_Op<"constant_f32_scalar_vector", [Pure]> {
+  let summary = "Create a constant f32 vector from a scalar value";
+  let description = [{
+    The `constant_f32_scalar_vector` operation creates a constant f32 vector 
+    from a scalar value.
+  }];
+
+  let arguments = (ins F32Attr:$value, I32Attr:$numElems);
+  let results = (outs VectorOf<[F32]>:$res);
+}
+
+def ConstantI32VectorOp : NPU_Op<"constant_i32_vector", [Pure]> {
+  let summary = "Create a constant i32 vector from a list of scalar values";
+  let description = [{
+    The `constant_i32_vector` operation creates a constant i32 vector 
+    from a list of scalar values.
+  }];
+
+  let arguments = (ins TypedAttrInterface:$values);
+  let results = (outs VectorOf<[I32]>:$res);
+}
+
+def ConstantF32VectorOp : NPU_Op<"constant_f32_vector", [Pure]> {
+  let summary = "Create a constant f32 vector from a list of scalar values";
+  let description = [{
+    The `constant_f32_vector` operation creates a constant f32 vector 
+    from a list of scalar values.
+  }];
+
+  let arguments = (ins TypedAttrInterface:$values);
+  let results = (outs VectorOf<[F32]>:$res);
+}
+
 def NPU_BlockIdOp : NPU_Op<"block_id", [Pure]> {
   let summary = "Get block id";
   let description = [{
@@ -244,6 +367,21 @@ def NPU_MOVEVF32Op : NPU_Op<"movev_f32", [Pure]> {
   let results = (outs AnyVector:$res);
 }
 
+// Note: BroadCastI32Op and NPU_MOVEVF32Op are both used to broadcast, the 
+// different is only the type. The name change is for better understanding: 
+// because it will not just used for Ascend.
+// TODO: BroadCastI32Op's argument is I32, does need to add another op for I32Attr?
+// 现在BroadCastI32Op的参数是Value类型的，如果对于编译时常量，是否需要另外一个op？现在如果broadcast一个常量的话，还需要一个额外的arith.constant op来转成Value类型，这个后面会被优化吗？
+def BroadCastI32Op : NPU_Op<"broadcast_i32", [Pure]> {
+  let summary = "broadcast int32 scalar to vector";
+  let description = [{
+    The `broadcast_i32` operation broadcast an i32 scalar to a vector.
+  }];
+
+  let arguments = (ins I32:$scalar, I32Attr:$numElems);
+  let results = (outs AnyVector:$res);
+}
+
 def AllocaOp : NPU_Op<"alloca", [MemoryEffects<[MemAlloc]>]> {
   let summary = "Allocate memory on ub";
   let description = [{
@@ -252,6 +390,16 @@ def AllocaOp : NPU_Op<"alloca", [MemoryEffects<[MemAlloc]>]> {
 
   let arguments = (ins I32Attr:$numElems);
   let results = (outs Res<LLVM_AnyPointer, "", [MemAlloc<AutomaticAllocationScopeResource>]>:$addrPtr);
+}
+
+// TODO: AllocaUBVectorOp 和 AllocaOp 最后要保留哪一个呢？AllocaOp 为什么设计成返回指针的形式呢？应该是因为当时采用的是生成LLVM IR的方式吧；所以要生成指针，往后面lowering的时候方便一些？
+def AllocaUBVectorOp : NPU_Op<"alloca_ub_vector", [MemoryEffects<[MemAlloc]>]> {
+  let summary = "Allocate memory on ub, get a vector";
+  let description = [{
+    The `alloca_ub_vector` operation allocates memory on ub, get a vector.
+  }];
+  let arguments = (ins I32Attr:$numElems);
+  let results = (outs AnyVector:$res);
 }
 
 // The reason why there are 2 types `mov_ub_to_ub`, is that at the beginning, 
@@ -319,6 +467,51 @@ def MovUBToOutOp : NPU_Op<"mov_ub_to_out", [MemoryEffects<[MemWrite]>]> {
     I32Attr:$numElems
   );
 
+}
+
+def MovUBToOutMaskedOp : NPU_Op<"mov_ub_to_out_masked", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Move data from UB to global memory with mask";
+  let description = [{
+    The `npu.mov_ub_to_out_masked` op represents storing data from ub to global
+    memory with mask.
+  }];
+
+  let arguments = (ins 
+    Arg<LLVM_AnyPointer, "the address to store data to", [MemWrite]>:$dstAddr, 
+    AnyVector:$valueToStore, 
+    I32Attr:$numElems,
+    AnyVector:$mask
+  );
+
+}
+
+// AssignUBI32Op 和 StoreUBI32Op 的区别: 前者赋的值是常量，后者是变量
+def AssignUBI32Op : NPU_Op<"assign_ub_i32", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Assign an i32 scalar to an ub vector";
+  let description = [{
+    The `npu.assign_ub_i32` op represents assigning an i32 scalar to an ub vector.
+  }];
+
+  let arguments = (ins AnyVector:$dstVector, I32Attr:$index, I32Attr:$srcScalar);
+}
+
+def LoadUBI32Op : NPU_Op<"load_ub_i32", [MemoryEffects<[MemRead]>]> {
+  let summary = "Load int32 from vector(ub memory) with given index";
+  let description = [{
+    The `load_ub_i32` operation loads vector(ub memory)'s index-st int32 value.
+  }];
+
+  let arguments = (ins AnyVector:$srcVector, I32Attr:$index);
+  let results = (outs I32:$res);
+}
+
+def StoreUBI32Op : NPU_Op<"store_ub_i32", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Store an i32 scalar to an ub vector with given index";
+  let description = [{
+    The `npu.store_ub_i32` op represents storing an i32 scalar to an ub vector with given index.
+  }];
+
+  let arguments = (ins AnyVector:$dstVector, I32Attr:$index, I32:$srcScalar);
 }
 
 #endif // NPU_DIALECT

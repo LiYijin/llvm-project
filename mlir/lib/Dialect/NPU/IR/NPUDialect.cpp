@@ -33,6 +33,12 @@ void NPUDialect::initialize() {
 #include "mlir/Dialect/NPU/IR/NPU.cpp.inc"
 
 //===----------------------------------------------------------------------===//
+// TableGen'd enum attribute definitions
+//===----------------------------------------------------------------------===//
+
+#include "mlir/Dialect/NPU/IR/NPUEnums.cpp.inc"
+
+//===----------------------------------------------------------------------===//
 // VAddF32Op
 //===----------------------------------------------------------------------===//
 
@@ -40,6 +46,16 @@ void VAddF32Op::build(mlir::OpBuilder &builder, mlir::OperationState &state,
                       Value lhs, Value rhs, IntegerAttr numElements) {
   auto resType = lhs.getType();
   VAddF32Op::build(builder, state, resType, lhs, rhs, numElements);
+}
+
+//===----------------------------------------------------------------------===//
+// VAddI32Op
+//===----------------------------------------------------------------------===//
+
+void VAddI32Op::build(mlir::OpBuilder &builder, mlir::OperationState &state,
+                      Value lhs, Value rhs, IntegerAttr numElements) {
+  auto resType = lhs.getType();
+  VAddI32Op::build(builder, state, resType, lhs, rhs, numElements);
 }
 
 //===----------------------------------------------------------------------===//
@@ -69,6 +85,16 @@ void VDivF32Op::build(mlir::OpBuilder &builder, mlir::OperationState &state,
                       Value lhs, Value rhs, IntegerAttr numElements) {
   auto resType = lhs.getType();
   VDivF32Op::build(builder, state, resType, lhs, rhs, numElements);
+}
+
+//===----------------------------------------------------------------------===//
+// VDIVI32Op
+//===----------------------------------------------------------------------===//
+
+void VDivI32Op::build(mlir::OpBuilder &builder, mlir::OperationState &state,
+                      Value lhs, Value rhs, IntegerAttr numElements) {
+  auto resType = lhs.getType();
+  VDivI32Op::build(builder, state, resType, lhs, rhs, numElements);
 }
 
 //===----------------------------------------------------------------------===//

@@ -12,6 +12,14 @@
 // Get NPU dialect declaration.
 #include "mlir/Dialect/NPU/IR/NPUDialect.h.inc"
 
+//===----------------------------------------------------------------------===//
+// NPU Dialect Enum Attributes
+//===----------------------------------------------------------------------===//
+
+#include "mlir/Dialect/NPU/IR/NPUEnums.h.inc"
+#define GET_ATTRDEF_CLASSES
+#include "mlir/Dialect/NPU/IR/NPUAttributes.h.inc"
+
 // Get NPU Ops classes declaration.
 #define GET_OP_CLASSES
 #include "mlir/Dialect/NPU/IR/NPU.h.inc"
