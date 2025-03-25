@@ -349,4 +349,21 @@ def MovUBToOutOp : NPU_Op<"mov_ub_to_out", [MemoryEffects<[MemWrite]>]> {
 
 }
 
+def forArgPlaceholder : NPU_Op<"forArgPlaceholder", []> {
+  let summary = "Move data from UB to main memory";
+  let description = [{
+    Use to describe vector argument.
+    Delete after allocation.
+  }];
+  let results = (outs AnyVector:$res);
+} 
+
+def MovUB2UBOp : NPU_Op<"MovUB2UBOp", [MemoryEffects<[MemRead,MemWrite]>]> {
+  let summary = "Move tensor to tensor";
+  let description = [{
+    move right to left
+  }];
+  let arguments = (ins AnyVector:$lhs, AnyVector:$rhs);
+}
+
 #endif // NPU_DIALECT
