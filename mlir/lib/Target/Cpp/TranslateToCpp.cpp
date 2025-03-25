@@ -800,6 +800,65 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
 }
 
 
+// Process the npu.vdiv_f32 operation:
+// %30 = "npu.vdiv_f32"(%28, %29) <{numElems = 8 : i32}> : (vector<8xf32>, vector<8xf32>) -> vector<8xf32>
+// ->
+// vdiv((__ubuf__ float*)i30, (__ubuf__ float*)i28, (__ubuf__ float*)i29, 1, 1, 1, 1, 8, 8, 8);
+
+// 函数原型：
+// void vdiv(__ubuf__ float *dst, __ubuf__ float *src0, __ubuf__ float *src1,
+//           uint8_t repeat, uint8_t dstBlockStride, uint8_t src0BlockStride,
+//           uint8_t src1BlockStride, uint8_t dstRepeatStride,
+//           uint8_t src0RepeatStride, uint8_t src1RepeatStride);
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::VDivF32Op vDivF32Op) {
+  raw_ostream &os = emitter.ostream();
+  os << "vdiv(";   // callee name
+
+  // print dst addr
+  auto dstType = vDivF32Op.getRes().getType();
+  assert(isa<VectorType>(dstType) &&
+         "ICT_ERROR(): vdiv_f32's res type is not vector type!");
+  auto dstVecType = dstType.cast<VectorType>();
+  os << "(";
+  if(failed(emitter.emitType(vDivF32Op.getLoc(), dstVecType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(vDivF32Op.getRes());
+  os << ", ";
+  // Here, has print: vdiv((__ubuf__ float*)i30, 
+
+  // print src1 addr
+  os << "(";
+  if(failed(emitter.emitType(vDivF32Op.getLoc(), dstVecType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(vDivF32Op.getLhs());
+  os << ", ";
+  // Here, has print: vdiv((__ubuf__ float*)i30, (__ubuf__ float*)i28, 
+
+  // print src2 addr
+  os << "(";
+  if(failed(emitter.emitType(vDivF32Op.getLoc(), dstVecType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(vDivF32Op.getRhs());
+  os << ", ";
+  // Here, has print: vdiv((__ubuf__ float*)i30, (__ubuf__ float*)i28, (__ubuf__ float*)i29, 
+
+  // print configs.
+  auto numElems = vDivF32Op.getNumElems();
+  if(numElems % 8 != 0) {
+    return emitError(vDivF32Op.getLoc(),
+                     "ICT_ERROR(): vdiv_f32's numElems is not multiple of 8!");
+  }
+  auto repeatTime = numElems * dstVecType.getElementType().getIntOrFloatBitWidth() / 256;
+  os << repeatTime << ", 1, 1, 1, 8, 8, 8)";
+  // Here has print
+  //  vdiv((__ubuf__ float*)i30, (__ubuf__ float*)i28, (__ubuf__ float*)i29, 1, 1, 1, 1, 8, 8, 8);
+  return success();
+}
+
 
 
 
@@ -999,6 +1058,118 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   os << repeatTime << ", 1, 0, 8, 0)";
   return success();
 }
+
+// Process the npu.vi32_to_vf32 operation:
+// %10 = "npu.vi32_to_vf32"(%9) : (vector<8xi32>) -> vector<8xf32>
+// ->
+// vconv_s322f32z((__ubuf__ float*)i10, (__ubuf__ int32_t*)i9, 1, 1, 1, 8, 8);
+
+// 函数原型：
+// void vconv_s322f32z(__ubuf__ float* dst, __ubuf__ int32_t* src, uint8_t
+//                     repeat, uint16_t dstBlockStride, uint16_t srcBlockStride, 
+//                     uint16_t dstRepeatStride, uint16_t srcRepeatStride);
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::VI32ToVF32Op vi32ToVF32Op) {
+  raw_ostream &os = emitter.ostream();
+  os << "vconv_s322f32z(";  // callee name
+  
+  auto dst = vi32ToVF32Op.getRes();
+  auto dstType = dst.getType();
+  if(!dstType.isa<VectorType>()) {
+    return emitError(vi32ToVF32Op.getLoc(),
+                     "ICT_ERROR(): vi32_to_vf32's res type is not vector type!");
+  }
+  os << "(";
+  if(failed(emitter.emitType(vi32ToVF32Op.getLoc(), dstType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(dst);
+  os << ", ";
+
+  auto srcVec = vi32ToVF32Op.getSrcVector();
+  auto srcType = srcVec.getType();
+  if(!srcType.isa<VectorType>()) {
+    return emitError(vi32ToVF32Op.getLoc(),
+                     "ICT_ERROR(): vi32_to_vf32's src type is not vector type!");
+  }
+  os << "(";
+  if(failed(emitter.emitType(vi32ToVF32Op.getLoc(), srcType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(srcVec);
+
+  auto dstVecType = dstType.cast<VectorType>();
+  auto numElems = dstVecType.getShape()[0];
+  if(numElems % 8 != 0) {
+    return emitError(vi32ToVF32Op.getLoc(),
+                     "ICT_ERROR(): vi32_to_vf32's numElems is not multiple of 8!");
+  }
+
+  auto dstElemType = dstVecType.getElementType();
+  auto repeatTime = numElems * dstElemType.getIntOrFloatBitWidth() / 256;
+  os << ", 1, 1, 8, 8)";
+  return success();
+}
+
+
+// Process the npu.vf32_to_vi32 operation:
+// %13 = "npu.vf32_to_vi32"(%12) : (vector<8xf32>) -> vector<8xi32>
+// ->
+// vconv_f322s32z((__ubuf__ int32_t*)i13, (__ubuf__ float*)i12, 1, 1, 1, 8, 8);
+
+// 函数原型：
+// void vconv_f322s32z(__ubuf__ int32_t *dst, __ubuf__ float *src, uint8_t repeat,
+//                     uint16_t dstBlockStride, uint16_t srcBlockStride,
+//                     uint16_t dstRepeatStride, uint16_t srcRepeatStride);
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::VF32ToVI32Op vF32ToVI32Op) {
+  raw_ostream &os = emitter.ostream();
+  os << "vconv_f322s32z(";  // callee name
+  
+  auto dst = vF32ToVI32Op.getRes();
+  auto dstType = dst.getType();
+  if(!dstType.isa<VectorType>()) {
+    return emitError(vF32ToVI32Op.getLoc(),
+                     "ICT_ERROR(): vf32_to_vi32's res type is not vector type!");
+  }
+  os << "(";
+  if(failed(emitter.emitType(vF32ToVI32Op.getLoc(), dstType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(dst);
+  os << ", ";
+
+  auto srcVec = vF32ToVI32Op.getSrcVector();
+  auto srcType = srcVec.getType();
+  if(!srcType.isa<VectorType>()) {
+    return emitError(vF32ToVI32Op.getLoc(),
+                     "ICT_ERROR(): vf32_to_vi32's src type is not vector type!");
+  }
+  os << "(";
+  if(failed(emitter.emitType(vF32ToVI32Op.getLoc(), srcType)))
+    return failure();
+  os << " )";
+  os << emitter.getOrCreateName(srcVec);
+
+  auto dstVecType = dstType.cast<VectorType>();
+  auto numElems = dstVecType.getShape()[0];
+  if(numElems % 8 != 0) {
+    return emitError(vF32ToVI32Op.getLoc(),
+                     "ICT_ERROR(): vf32_to_vi32's numElems is not multiple of 8!");
+  }
+
+  auto dstElemType = dstVecType.getElementType();
+  auto repeatTime = numElems * dstElemType.getIntOrFloatBitWidth() / 256;
+  os << ", 1, 1, 8, 8)";
+  return success();
+}
+
+
+
+
+
+
+
 
 // Process the npu.atomic_add_f32 operation:
 // "npu.atomic_add_f32"(%53, %36) <{numElems = 8 : i32}> : (!llvm.ptr<1>, vector<8xf32>) -> ()
@@ -2719,9 +2890,10 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
           .Case<LLVM::GEPOp>([&](auto op) { return printLLVMGEPOp(*this, op); })
           // NPU ops.
           .Case<npu::MovOutToUBOp, npu::MovUBToOutOp, 
-                npu::VAddF32Op, npu::VAddI32Op, npu::VMulF32Op,
+                npu::VAddF32Op, npu::VAddI32Op, npu::VMulF32Op, npu::VDivF32Op,
                 npu::VCmpI32Op, npu::VSelOp, npu::AtomicAddF32Op,
                 npu::BroadCastI32Op, npu::MOVEVF32Op, npu::AssignUBI32Op, 
+                npu::VI32ToVF32Op, npu::VF32ToVI32Op, 
                 npu::LoadUBI32Op, npu::StoreUBI32Op, 
                 npu::AllocaUBVectorOp, npu::AllocaAddr,
                 npu::BlockIdOp>(

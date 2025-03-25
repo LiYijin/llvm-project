@@ -289,6 +289,26 @@ def VTanhF32Op : NPU_Op<"vtanh_f32", [Pure]> {
   ];
 }
 
+def VI32ToVF32Op : NPU_Op<"vi32_to_vf32", [Pure]> {
+  let summary = "Convert int32 vector to float32 vector";
+  let description = [{
+    The `vi32_to_vf32` operation converts int32 vector to float32 vector.
+  }];
+
+  let arguments = (ins AnyVector:$srcVector);
+  let results = (outs AnyVector:$res);
+}
+
+def VF32ToVI32Op : NPU_Op<"vf32_to_vi32", [Pure]> {
+  let summary = "Convert float32 vector to int32 vector";
+  let description = [{
+    The `vf32_to_vi32` operation converts float32 vector to int32 vector.
+  }];
+
+  let arguments = (ins AnyVector:$srcVector);
+  let results = (outs AnyVector:$res);
+}
+
 def ConstantI32ScalarVectorOp : NPU_Op<"constant_i32_scalar_vector", [Pure]> {
   let summary = "Create a constant i32 vector from a scalar value";
   let description = [{
