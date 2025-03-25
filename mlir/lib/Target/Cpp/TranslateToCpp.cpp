@@ -599,6 +599,71 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   return success();
 }
 
+// Process the npu.mov_ub_to_ub operation:
+// "npu.mov_ub_to_ub"(%53, %36) : (vector<8xf32>, vector<8xf32>) -> ()
+// ->
+// copy_ubuf_to_ubuf((__ubuf__ float *)i53, (__ubuf__ float *)i36, 0, 1, 1, 0, 0);
+
+// 函数原型：
+// void copy_ubuf_to_ubuf(__ubuf__ void *dst, __ubuf__ void *src, uint8_t sid,
+//                        uint16_t nBurst, uint16_t lenBurst, uint16_t srcStride,
+//                        uint16_t dstStride);
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::MovUBToUBOp movUBToUBOp) {
+  raw_ostream &os = emitter.ostream();
+  os << "copy_ubuf_to_ubuf(";   // callee name
+
+  auto dstType = movUBToUBOp.getDst().getType();   // Res type is vector<Nxf32>
+  assert(isa<VectorType>(dstType) &&
+         "ICT_ERROR(): mov_ub_to_ub's dst type is not vector type!");
+  auto dstVecType = dstType.cast<VectorType>();
+  
+  os << "(";
+  if(failed(emitter.emitType(movUBToUBOp.getLoc(), dstType)))
+    return failure();
+  os << ")";
+  os << emitter.getOrCreateNameAlias(movUBToUBOp.getDst());
+  os << ", ";
+
+  os << "(";
+  if(failed(emitter.emitType(movUBToUBOp.getLoc(), dstType)))
+    return failure();
+  os << ")";
+  os << emitter.getOrCreateNameAlias(movUBToUBOp.getSrc());
+  os << ", ";
+
+  unsigned sid = 0;
+  unsigned numElems = dstVecType.getNumElements();
+  if(numElems % 8 != 0) {
+    return emitError(movUBToUBOp.getLoc(),
+                     "ICT_ERROR(): mov_ub_to_ub's dst type's numElems is not "
+                     "multiple of 8!");
+  }
+  // TODO: nBurst is always 1? 
+  unsigned nBurst = 1;
+  unsigned lenBurst = numElems * dstVecType.getElementType().getIntOrFloatBitWidth() / 256;
+  os << sid << ", " << nBurst << ", " << lenBurst << ", 0, 0)";
+  return success();
+}
+
+// Process the npu.for_arg_placeholder operation:
+// %53 = "npu.forArgPlaceholder"() {"ub-allocation-index" = 13 : i32} : () -> vector<8xf32>
+// ->
+// null?
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::ForArgPlaceholderOp forArgPlaceholderOp) {
+  return success();
+}
+
+
+
+
+
+
+
+
+
+
 // Process the npu.vadd operation:
 // %8 = "npu.vadd"(%5, %7) <{numElems = 8 : i32}> : (vector<8xf32>,
 // vector<8xf32>) -> vector<8xf32>
@@ -2889,13 +2954,13 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
           // LLVM ops.
           .Case<LLVM::GEPOp>([&](auto op) { return printLLVMGEPOp(*this, op); })
           // NPU ops.
-          .Case<npu::MovOutToUBOp, npu::MovUBToOutOp, 
+          .Case<npu::MovOutToUBOp, npu::MovUBToOutOp, npu::MovUBToUBOp, 
                 npu::VAddF32Op, npu::VAddI32Op, npu::VMulF32Op, npu::VDivF32Op,
                 npu::VCmpI32Op, npu::VSelOp, npu::AtomicAddF32Op,
                 npu::BroadCastI32Op, npu::MOVEVF32Op, npu::AssignUBI32Op, 
                 npu::VI32ToVF32Op, npu::VF32ToVI32Op, 
                 npu::LoadUBI32Op, npu::StoreUBI32Op, 
-                npu::AllocaUBVectorOp, npu::AllocaAddr,
+                npu::AllocaUBVectorOp, npu::AllocaAddr, npu::ForArgPlaceholderOp, 
                 npu::BlockIdOp>(
               [&](auto op) { return printNPUOp(*this, op); })
           .Case<emitc::MemberOp>([&](auto op) {

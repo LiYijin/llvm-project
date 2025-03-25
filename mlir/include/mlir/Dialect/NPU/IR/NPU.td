@@ -562,7 +562,7 @@ def StoreUBI32Op : NPU_Op<"store_ub_i32", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins AnyVector:$dstVector, I32Attr:$index, I32:$srcScalar);
 }
 
-def forArgPlaceholder : NPU_Op<"forArgPlaceholder", []> {
+def ForArgPlaceholderOp : NPU_Op<"for_arg_placeholder", []> {
   let summary = "Move data from UB to main memory";
   let description = [{
     Use to describe vector argument.
@@ -571,12 +571,12 @@ def forArgPlaceholder : NPU_Op<"forArgPlaceholder", []> {
   let results = (outs AnyVector:$res);
 } 
 
-def MovUB2UBOp : NPU_Op<"MovUB2UBOp", [MemoryEffects<[MemRead,MemWrite]>]> {
+def MovUBToUBOp : NPU_Op<"mov_ub_to_ub", [MemoryEffects<[MemRead,MemWrite]>]> {
   let summary = "Move tensor to tensor";
   let description = [{
     move right to left
   }];
-  let arguments = (ins AnyVector:$lhs, AnyVector:$rhs);
+  let arguments = (ins AnyVector:$dst, AnyVector:$src);
 }
 
 #endif // NPU_DIALECT
