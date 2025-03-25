@@ -42,6 +42,24 @@ def NPUCmpIPredicateAttr : I64EnumAttr<
 }
 
 /*************** Binary operations ***************/
+def SetFlag : NPU_Op<"set_flag", []> {
+  let summary = "Set flag operation";
+  let description = [{
+    The `set_flag` operation sets the flag.
+  }];
+
+  let arguments = (ins I32Attr:$pipeA, I32Attr:$pipeB, I32Attr:$PhyID);
+}
+
+def WaitFlag : NPU_Op<"wait_flag", []> {
+  let summary = "Wait flag operation";
+  let description = [{
+    The `wait_flag` operation waits for the flag.
+  }];
+
+  let arguments = (ins I32Attr:$pipeA, I32Attr:$pipeB, I32Attr:$PhyID);
+}
+
 def VAddF32Op : NPU_Op<"vadd", [Pure]> {
   let summary = "Vector add operation";
   let description = [{
@@ -402,6 +420,16 @@ def AllocaUBVectorOp : NPU_Op<"alloca_ub_vector", [MemoryEffects<[MemAlloc]>]> {
   let results = (outs AnyVector:$res);
 }
 
+def AllocaAddr : NPU_Op<"alloca_addr", [MemoryEffects<[MemAlloc]>]> {
+  let summary = "Alloca numBytes memory on ub at numOffset.";
+  let description = [{
+    Alloca numBytes memory on ub at numOffset.
+  }];
+
+  let arguments = (ins I64Attr:$numOffset,I64Attr:$numBytes);
+  let results = (outs Res<AnyVector, "", [MemAlloc<AutomaticAllocationScopeResource>]>:$vec);
+}
+
 // The reason why there are 2 types `mov_ub_to_ub`, is that at the beginning, 
 // the ub variable in NPU dialect is in the form of vector, after introducing
 // shared memory, the ub has another form: pointer, so design 2 `move_ub_to_ub`
@@ -512,6 +540,23 @@ def StoreUBI32Op : NPU_Op<"store_ub_i32", [MemoryEffects<[MemWrite]>]> {
   }];
 
   let arguments = (ins AnyVector:$dstVector, I32Attr:$index, I32:$srcScalar);
+}
+
+def forArgPlaceholder : NPU_Op<"forArgPlaceholder", []> {
+  let summary = "Move data from UB to main memory";
+  let description = [{
+    Use to describe vector argument.
+    Delete after allocation.
+  }];
+  let results = (outs AnyVector:$res);
+} 
+
+def MovUB2UBOp : NPU_Op<"MovUB2UBOp", [MemoryEffects<[MemRead,MemWrite]>]> {
+  let summary = "Move tensor to tensor";
+  let description = [{
+    move right to left
+  }];
+  let arguments = (ins AnyVector:$lhs, AnyVector:$rhs);
 }
 
 #endif // NPU_DIALECT
