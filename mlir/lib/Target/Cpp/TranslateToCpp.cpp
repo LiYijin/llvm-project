@@ -15,6 +15,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
@@ -38,6 +39,7 @@
 
 using namespace mlir;
 using namespace mlir::memref;
+using namespace mlir::arith;
 using namespace mlir::emitc;
 using llvm::formatv;
 
@@ -402,10 +404,37 @@ static LogicalResult printOperation(CppEmitter &emitter,
   arith::AddIOp addOp) {
 return printArithBinaryOp(emitter, addOp, "+");
 }
-
+static LogicalResult printOperation(CppEmitter &emitter,
+  arith::AddFOp addOp) {
+return printArithBinaryOp(emitter, addOp, "+");
+}
 static LogicalResult printOperation(CppEmitter &emitter,
   arith::SubIOp subOp) {
 return printArithBinaryOp(emitter, subOp, "-");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+  arith::ShRUIOp shrOp) {
+return printArithBinaryOp(emitter, shrOp, ">>");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+  arith::MaxNumFOp maxOp) {
+    auto &os = emitter.ostream();
+    auto lhs = maxOp.getLhs();
+    auto rhs = maxOp.getRhs();
+
+    if (failed(emitter.emitAssignPrefix(*maxOp.getOperation())))
+    return failure();
+
+    if (!emitter.hasValueInScope(lhs) || !emitter.hasValueInScope(rhs))
+    return failure();
+    os << "__cn_scalar_max_f32(";
+    os << emitter.getOrCreateName(lhs);
+    os << ", ";
+    os << emitter.getOrCreateName(rhs);
+    os << ")";
+    return success();
 }
 
 static LogicalResult printOperation(CppEmitter &emitter,
@@ -646,6 +675,38 @@ static LogicalResult printLLVMGEPOp(CppEmitter &emitter,
     return success();
   }
   return failure();
+}
+
+static LogicalResult printNPUOp(CppEmitter &emitter,
+  npu::VMaxF32Op maxOp) {
+    auto &os = emitter.ostream();
+    auto result = maxOp->getResult(0);
+    if (!emitter.shouldDeclareVariablesAtTop()) {
+      if (failed(emitter.emitVariableDeclaration(result, true)))
+        return failure();
+    }
+
+    if (!emitter.hasValueInScope(maxOp.getLhs()) ||
+        !emitter.hasValueInScope(maxOp.getRhs())) {
+      return maxOp->emitOpError("ICT_ERROR(): operator was not defined!");
+    }
+    os << "__cn_vector_max_f32(";
+
+    auto dstType = maxOp.getType();
+    auto dstElemType = dstType.getElementType();
+    // npu binary's addrsapce must be 6.
+    auto dstPtrType = LLVM::LLVMPointerType::get(dstElemType, 6);
+
+    auto numElems = maxOp.getNumElems();
+    if (numElems % 8 != 0) {
+      return maxOp->emitOpError("ICT_ERROR(): npu vmax_f32 op's numElems is not multiple of 8!");
+    }
+
+    os << numElems << ", "
+       << "(float *)" << emitter.getOrCreateName(maxOp.getRes()) << ", "
+       << "(float *)" << emitter.getOrCreateName(maxOp.getLhs()) << ", "
+       << "(float *)" << emitter.getOrCreateName(maxOp.getRhs()) << ")";
+    return success();
 }
 
 static LogicalResult printNPUOp(CppEmitter &emitter,
@@ -2043,7 +2104,8 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
                 arith::AddIOp, arith::ShLIOp, arith::DivSIOp,
                 arith::RemSIOp, arith::DivUIOp, arith::RemUIOp,
                 arith::MulIOp, arith::CmpIOp, arith::SubIOp,
-                arith::ExtSIOp>(
+                arith::ExtSIOp, arith::ShRUIOp, arith::MaxNumFOp,
+                arith::AddFOp>(
               [&](auto op) { return printOperation(*this, op); })
           .Case<emitc::LiteralOp>([&](auto op) { return success(); })
           // GPU ops.
@@ -2064,7 +2126,7 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
                 npu::MovUBToUBWriteOp, npu::MovUBToUBReadOp,
                 npu::VAddF32Op, npu::VSubF32Op, npu::VMulF32Op,
                 npu::VTanhF32Op, npu::VExpF32Op, npu::VRecipF32Op,
-                npu::VSigmoidF32Op,
+                npu::VSigmoidF32Op, npu::VMaxF32Op,
                 npu::MOVEVF32Op, npu::BlockIdOp, npu::BlockNumOp,
                 npu::LoadF32Op, npu::AtomicAddF32Op,
                 npu::AllocaOp>(
