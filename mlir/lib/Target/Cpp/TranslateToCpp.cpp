@@ -356,16 +356,6 @@ LogicalResult printCStyleCastOp(CppEmitter &emitter, OpTy operation) {
   return success();
 }
 
-static LogicalResult 
-printOperation(CppEmitter &emitter, arith::IndexCastOp op) {
-  return printCStyleCastOp(emitter, op);
-}
-
-static LogicalResult 
-printOperation(CppEmitter &emitter, arith::ExtSIOp op) {
-  return printCStyleCastOp(emitter, op);
-}
-
 template <typename OpTy>
 static LogicalResult printArithBinaryOp(CppEmitter &emitter, OpTy arithOp,
                                         StringRef opcode) {
@@ -506,6 +496,27 @@ static LogicalResult printOperation(CppEmitter &emitter,
 
   os << emitter.getOrCreateName(rhs);
 
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    arith::SelectOp selectOp) {
+  auto &os = emitter.ostream();
+
+  auto cond = selectOp.getCondition();
+  auto trueValue = selectOp.getTrueValue();
+  auto falseValue = selectOp.getFalseValue();
+
+  if (!emitter.hasValueInScope(cond) ||
+      !emitter.hasValueInScope(trueValue) || !emitter.hasValueInScope(falseValue))
+    return failure();
+  
+  if (failed(emitter.emitAssignPrefix(*(selectOp.getOperation()))))
+    return failure();
+  
+  os << "(" << emitter.getOrCreateName(cond) << ") ? ("
+     << emitter.getOrCreateName(trueValue) << ") : ("
+     << emitter.getOrCreateName(falseValue) << ")";
   return success();
 }
 
@@ -2130,11 +2141,11 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
           .Case<scf::ForOp, scf::YieldOp>(
               [&](auto op) { return printOperation(*this, op); })
           // Arithmetic ops.
-          .Case<arith::ConstantOp, arith::IndexCastOp,
+          .Case<arith::ConstantOp, arith::SelectOp,
                 arith::AddIOp, arith::ShLIOp, arith::DivSIOp,
                 arith::RemSIOp, arith::DivUIOp, arith::RemUIOp,
                 arith::MulIOp, arith::CmpIOp, arith::SubIOp,
-                arith::ExtSIOp, arith::ShRUIOp, arith::MaxNumFOp,
+                arith::ShRUIOp, arith::MaxNumFOp,
                 arith::AddFOp, arith::AndIOp, arith::DivFOp>(
               [&](auto op) { return printOperation(*this, op); })
           .Case<emitc::LiteralOp>([&](auto op) { return success(); })
