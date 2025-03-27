@@ -32,7 +32,6 @@
 #include "mlir/Dialect/NPU/IR/NPUDialect.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/ADT/StringSwitch.h"
-#include "llvm/ADT/TypeSwitch.h"
 #include <utility>
 
 #define DEBUG_TYPE "translate-to-cpp"
@@ -296,15 +295,33 @@ static LogicalResult printOperation(CppEmitter &emitter,
 }
 
 static LogicalResult printOperation(CppEmitter &emitter,
+                                    LLVM::ConstantOp constantOp) {
+                                      Operation *operation = constantOp.getOperation();
+                                      Attribute value = constantOp.getValueAttr();
+                                    
+                                      return printConstantOp(emitter, operation, value);
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
                                     emitc::AssignOp assignOp) {
   auto variableOp = cast<emitc::VariableOp>(assignOp.getVar().getDefiningOp());
   OpResult result = variableOp->getResult(0);
 
-  if (failed(emitter.emitVariableAssignment(result)))
-    return failure();
+  if (auto vecTy = dyn_cast<VectorType>(result.getType())) {
+    // Since the vector type will be lowered as an array on nram which is not assignable,
+    // so we should overload the emitter using a nram to nram memcpy instead.
+    if (!emitter.hasValueInScope(result))
+      return failure();
+    
+    emitter.ostream() << "__memcpy(" << emitter.getOrCreateName(result)
+                      << ", " << emitter.getOrCreateName(assignOp.getValue())
+                      << ", " << vecTy.getNumElements() * vecTy.getElementTypeBitWidth() / 8 << ", NRAM2NRAM)";
+  } else {
+    if (failed(emitter.emitVariableAssignment(result)))
+      return failure();
 
-  emitter.ostream() << emitter.getOrCreateName(assignOp.getValue());
-
+    emitter.ostream() << emitter.getOrCreateName(assignOp.getValue());
+  }
   return success();
 }
 
@@ -401,6 +418,11 @@ return printArithBinaryOp(emitter, mulOp, "*");
 }
 
 static LogicalResult printOperation(CppEmitter &emitter,
+  arith::DivFOp divOp) {
+return printArithBinaryOp(emitter, divOp, "/");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
   arith::AddIOp addOp) {
 return printArithBinaryOp(emitter, addOp, "+");
 }
@@ -411,6 +433,11 @@ return printArithBinaryOp(emitter, addOp, "+");
 static LogicalResult printOperation(CppEmitter &emitter,
   arith::SubIOp subOp) {
 return printArithBinaryOp(emitter, subOp, "-");
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+  arith::AndIOp andOp) {
+return printArithBinaryOp(emitter, andOp, "&");
 }
 
 static LogicalResult printOperation(CppEmitter &emitter,
@@ -529,7 +556,10 @@ static LogicalResult printMemrefLdStOp(CppEmitter &emitter,
   if (failed(emitter.emitAssignPrefix(*loadOp.getOperation())))
       return failure();
   os << emitter.getOrCreateName(addr) << "[";
-  os << emitter.getOrCreateName(loadOp.getIndices()[0]);
+  if (loadOp.getIndices().size())
+    os << emitter.getOrCreateName(loadOp.getIndices()[0]);
+  else
+    os << "0";
   os <<"]";
   return success();
 }
@@ -2105,7 +2135,7 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
                 arith::RemSIOp, arith::DivUIOp, arith::RemUIOp,
                 arith::MulIOp, arith::CmpIOp, arith::SubIOp,
                 arith::ExtSIOp, arith::ShRUIOp, arith::MaxNumFOp,
-                arith::AddFOp>(
+                arith::AddFOp, arith::AndIOp, arith::DivFOp>(
               [&](auto op) { return printOperation(*this, op); })
           .Case<emitc::LiteralOp>([&](auto op) { return success(); })
           // GPU ops.
@@ -2120,6 +2150,7 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
           // LLVM ops.
           .Case<LLVM::GEPOp>([&](auto op) { return printLLVMGEPOp(*this, op); })
           .Case<LLVM::LoadOp, LLVM::StoreOp>([&](auto op) { return printLLVMLdStOp(*this, op); })
+          .Case<LLVM::ConstantOp>([&](auto op) { return printOperation(*this, op); })
           .Case<memref::LoadOp, memref::StoreOp>([&](auto op) { return printMemrefLdStOp(*this, op); })
           // NPU ops.
           .Case<npu::MovOutToUBOp, npu::MovUBToOutOp,
