@@ -613,6 +613,7 @@ static LogicalResult printMemrefLdStOp(CppEmitter &emitter,
   if (failed(emitter.emitAssignPrefix(*storeOp.getOperation())))
     return failure();
   if (failed(printMemRef(emitter, addr, storeOp.getIndices())))
+    return failure();
   
   os << " = " << emitter.getOrCreateName(value);
 
