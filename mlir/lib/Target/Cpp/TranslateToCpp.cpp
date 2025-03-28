@@ -557,38 +557,64 @@ static LogicalResult printLLVMLdStOp(CppEmitter &emitter,
   return success(); 
 }
 
+static LogicalResult printMemRef(CppEmitter &emitter,
+                                 Value addr, ValueRange indices) {
+  auto &os = emitter.ostream();
+  if (!emitter.hasValueInScope(addr))
+    return failure();
+  
+  os << emitter.getOrCreateName(addr) << "[";
+
+  if (indices.size() == 0) {
+    os << "0";
+  } else if (indices.size() == 1) {
+    os << emitter.getOrCreateName(indices.front());
+  } else { 
+    SmallVector<int64_t> strides;
+    int64_t offset;
+
+    if (failed(getStridesAndOffset(cast<MemRefType>(addr.getType()),
+                                   strides, offset)))
+      return failure();
+
+    assert(strides.size() == indices.size());
+    for (auto [index, stride] : llvm::zip(indices, strides)) {
+      os << stride << "*" << emitter.getOrCreateName(index) << " + ";
+    }
+    os << " " << offset;
+  }
+
+  os << "]";
+  return success();  
+}
+
 static LogicalResult printMemrefLdStOp(CppEmitter &emitter,
-                                     memref::LoadOp loadOp) {
+                                       memref::LoadOp loadOp) {
   auto &os = emitter.ostream();
   auto loc = loadOp.getLoc();
 
   auto resultType = loadOp.getType();
-  Value addr = loadOp.getMemref();
+  auto addr = loadOp.getMemref();
   if (failed(emitter.emitAssignPrefix(*loadOp.getOperation())))
-      return failure();
-  os << emitter.getOrCreateName(addr) << "[";
-  if (loadOp.getIndices().size())
-    os << emitter.getOrCreateName(loadOp.getIndices()[0]);
-  else
-    os << "0";
-  os <<"]";
+    return failure();
+  if (failed(printMemRef(emitter, addr, loadOp.getIndices())))
+    return failure();
   return success();
 }
-static LogicalResult printMemrefLdStOp(CppEmitter &emitter,
-                                     memref::StoreOp StoreOp) {
-  auto &os = emitter.ostream();
-  auto loc = StoreOp.getLoc();
-  auto value = StoreOp.getValue();
-  auto addr = StoreOp.getMemRef();
 
-  auto resultType = StoreOp.getValue().getType();
-  if (failed(emitter.emitAssignPrefix(*StoreOp.getOperation())))
+static LogicalResult printMemrefLdStOp(CppEmitter &emitter,
+                                       memref::StoreOp storeOp) {
+  auto &os = emitter.ostream();
+  auto loc = storeOp.getLoc();
+  auto value = storeOp.getValue();
+  auto addr = storeOp.getMemRef();
+
+  auto resultType = storeOp.getValue().getType();
+  if (failed(emitter.emitAssignPrefix(*storeOp.getOperation())))
     return failure();
-  os << emitter.getOrCreateName(addr);
-  os << "[";
-  os << emitter.getOrCreateName(StoreOp.getIndices()[0]);
-  os << "] = ";
-  os << emitter.getOrCreateName(value);
+  if (failed(printMemRef(emitter, addr, storeOp.getIndices())))
+  
+  os << " = " << emitter.getOrCreateName(value);
 
   return success();
 }
