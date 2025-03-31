@@ -500,6 +500,47 @@ static LogicalResult printOperation(CppEmitter &emitter,
 }
 
 static LogicalResult printOperation(CppEmitter &emitter,
+  arith::CmpFOp &cmpOp) {
+  auto &os = emitter.ostream();
+
+  auto lhs = cmpOp.getLhs();
+  auto rhs = cmpOp.getRhs();
+
+  if (failed(emitter.emitAssignPrefix(*cmpOp.getOperation())))
+  return failure();
+
+  if (!emitter.hasValueInScope(lhs) || !emitter.hasValueInScope(rhs))
+  return failure();
+
+  os << emitter.getOrCreateName(lhs);
+
+  switch (cmpOp.getPredicate()) {
+  case arith::CmpFPredicate::OEQ:
+  os << " == ";
+  break;
+  case arith::CmpFPredicate::UNE:
+  os << " != ";
+  break;
+  case arith::CmpFPredicate::OGE:
+  os << " >= ";
+  break;
+  case arith::CmpFPredicate::OGT:
+  os << " > ";
+  break;
+  case arith::CmpFPredicate::OLE:
+  os << " <= ";
+  break;
+  case arith::CmpFPredicate::OLT:
+  os << " < ";
+  break;
+  }
+
+  os << emitter.getOrCreateName(rhs);
+
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
                                     arith::SelectOp selectOp) {
   auto &os = emitter.ostream();
 
@@ -2173,7 +2214,8 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
                 arith::RemSIOp, arith::DivUIOp, arith::RemUIOp,
                 arith::MulIOp, arith::CmpIOp, arith::SubIOp,
                 arith::ShRUIOp, arith::MaxNumFOp,
-                arith::AddFOp, arith::AndIOp, arith::DivFOp>(
+                arith::AddFOp, arith::AndIOp, arith::DivFOp,
+                arith::CmpFOp>(
               [&](auto op) { return printOperation(*this, op); })
           .Case<emitc::LiteralOp>([&](auto op) { return success(); })
           // GPU ops.
