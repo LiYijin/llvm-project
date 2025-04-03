@@ -541,6 +541,22 @@ static LogicalResult printOperation(CppEmitter &emitter,
 }
 
 static LogicalResult printOperation(CppEmitter &emitter,
+                                    arith::IndexCastOp castOp) {
+  raw_ostream &os = emitter.ostream();
+  Operation &op = *castOp.getOperation();
+
+  if (failed(emitter.emitAssignPrefix(op)))
+    return failure();
+  os << "(";
+  if (failed(emitter.emitType(op.getLoc(), op.getResult(0).getType())))
+    return failure();
+  os << ") ";
+  os << emitter.getOrCreateName(castOp.getOperand());
+
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
                                     arith::SelectOp selectOp) {
   auto &os = emitter.ostream();
 
@@ -2302,7 +2318,7 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
                 arith::MulIOp, arith::CmpIOp, arith::SubIOp,
                 arith::ShRUIOp, arith::MaxNumFOp,
                 arith::AddFOp, arith::AndIOp, arith::DivFOp,
-                arith::CmpFOp>(
+                arith::CmpFOp, arith::IndexCastOp>(
               [&](auto op) { return printOperation(*this, op); })
           .Case<emitc::LiteralOp>([&](auto op) { return success(); })
           // GPU ops.
