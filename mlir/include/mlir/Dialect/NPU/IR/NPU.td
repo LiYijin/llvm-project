@@ -347,4 +347,44 @@ def MovUBToOutOp : NPU_Op<"mov_ub_to_out", [MemoryEffects<[MemWrite]>]> {
 
 }
 
+
+def MlpOp : NPU_Op<"mlp", [Pure]> {
+  let summary = "Perform a Cambricon NPU mlp operation.";
+  let description = [{}];
+
+  let arguments = (ins
+    AnyVector:$input,
+    AnyVector:$filter,
+    I32Attr:$numRows,
+    I32Attr:$numCols);
+
+  let results = (outs AnyVector:$res);
+}
+
+def ReshapeFilterOp : NPU_Op<"reshape_filter", [Pure]> {
+  let summary = "Perform a Cambricon NPU reshape filter operation.";
+  let description = [{}];
+
+  let arguments = (ins
+    AnyVector:$input,
+    I32Attr:$batch,
+    I32Attr:$channels,
+    I32Attr:$height,
+    I32Attr:$width);
+
+  let results = (outs AnyVector:$res);
+}
+
+def TransposeOp : NPU_Op<"transpose", [Pure]> {
+  let summary = "Perform a 2D transpose operation.";
+  let description = [{}];
+
+  let arguments = (ins
+    AnyVector:$input,
+    I32Attr:$numRows,
+    I32Attr:$numCols);
+  
+  let results = (outs AnyVector:$res);
+}
+
 #endif // NPU_DIALECT

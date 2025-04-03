@@ -1084,6 +1084,8 @@ static LogicalResult printNPUBinOp(CppEmitter &emitter,
       .Cases("vsub_f32", "vsub", "__bang_sub")
       .Cases("vmul_f32", "vmul", "__bang_mul")
       .Cases("vdiv_f32", "vdiv", "__bang_div")
+      .Case("vadds_f32", "__bang_add_scalar")
+      .Case("vmuls_f32", "__bang_mul_scalar")
       .Default("");
   
   if (intrinsic.empty())
@@ -1133,6 +1135,8 @@ static LogicalResult printNPUOp(CppEmitter &emitter,\
 DEFINE_NPU_BINOP_EMITTER(VAddF32Op)
 DEFINE_NPU_BINOP_EMITTER(VSubF32Op)
 DEFINE_NPU_BINOP_EMITTER(VMulF32Op)
+DEFINE_NPU_BINOP_EMITTER(VAddSF32Op)
+DEFINE_NPU_BINOP_EMITTER(VMulSF32Op)
 // DEFINE_NPU_BINOP_EMITTER(VDivF32Op)
 
 #undef DEFINE_NPU_BINOP_EMITTER
@@ -1206,6 +1210,89 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
      << allocaOp.getNumElems() << "]";
 
   return success();
+}
+
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::TransposeOp transOp) {
+  auto &os = emitter.ostream();
+  auto result = transOp->getResult(0);
+
+  if (!emitter.shouldDeclareVariablesAtTop()) {
+    if (failed(emitter.emitVariableDeclaration(result, true)))
+      return failure();
+  }
+  
+  os << "__bang_transpose(" << emitter.getOrCreateName(result)
+     << ", " << emitter.getOrCreateName(transOp.getInput()) << ", "
+     << transOp.getNumRows() << ", " << transOp.getNumCols() << ")";
+  return success();
+}
+
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::ReshapeFilterOp reshapeOp) {
+  auto &os = emitter.ostream();
+  auto result = reshapeOp->getResult(0);
+
+  // if (!emitter.shouldDeclareVariablesAtTop()) {
+  //   if (failed(emitter.emitVariableDeclaration(result, true)))
+  //     return failure();
+  // }
+
+  auto input = reshapeOp.getInput();
+  auto transOp = input.getDefiningOp<npu::TransposeOp>();
+  assert(transOp != nullptr && "Input of reshape_filter is not a transpose!");
+
+  // Try to reuse the buffer of the input vector of transpose op.
+  // TODO(wcao): Implement a static memory planner to do memory reuse!!
+  input = transOp.getInput();
+  if (llvm::range_size(input.getUsers()) == 1) {
+    emitter.createValueName(result, emitter.getOrCreateName(input));
+  } else if (!emitter.shouldDeclareVariablesAtTop()) {
+    if (failed(emitter.emitVariableDeclaration(result, true)))
+      return failure();
+  }
+  
+  os << "__bang_reshape_filter(" << emitter.getOrCreateName(result)
+     << ", " << emitter.getOrCreateName(reshapeOp.getInput()) << ", "
+     << reshapeOp.getBatch() << ", " << reshapeOp.getChannels() << ", "
+     << reshapeOp.getHeight() << ", " << reshapeOp.getWidth() << ")";
+  return success();
+}
+
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::MlpOp mlpOp) {
+  auto &os = emitter.ostream();
+  auto result = mlpOp->getResult(0);
+
+  if (!emitter.shouldDeclareVariablesAtTop()) {
+    if (failed(emitter.emitVariableDeclaration(result, true)))
+      return failure();
+  }
+  
+  auto filter = mlpOp.getFilter();
+  auto filterType = cast<VectorType>(filter.getType());
+
+  // Declare a wram buffer with the same size of the filter vector,
+  // and copy the filter data from npu to wram.
+  os << "__wram__ ";
+  if (failed(emitter.emitType(mlpOp.getLoc(), filterType.getElementType())))
+    return failure();
+  
+  os << " " << emitter.getOrCreateName(filter) << "_wram["
+     << filterType.getNumElements() << "];\n";
+  
+  os << "__memcpy(" << emitter.getOrCreateName(filter) << "_wram, "
+     << emitter.getOrCreateName(filter) << ", "
+     << filterType.getNumElements() * filterType.getElementType().getIntOrFloatBitWidth() / 8
+     << ", NRAM2WRAM);\n";
+  
+  // Invoke the __bang_mlp intrisinc function.
+  os << "__bang_mlp(" << emitter.getOrCreateName(result) << ", "
+     << emitter.getOrCreateName(mlpOp.getInput()) << ", "
+     << emitter.getOrCreateName(filter) << "_wram, "
+     << mlpOp.getNumRows() << ", " << mlpOp.getNumCols() << ")";
+
+  return success();           
 }
 
 static LogicalResult printBinaryOperation(CppEmitter &emitter,
@@ -2236,10 +2323,12 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
           .Case<npu::MovOutToUBOp, npu::MovUBToOutOp,
                 npu::MovUBToUBWriteOp, npu::MovUBToUBReadOp,
                 npu::VAddF32Op, npu::VSubF32Op, npu::VMulF32Op,
+                npu::VAddSF32Op, npu::VMulSF32Op,
                 npu::VTanhF32Op, npu::VExpF32Op, npu::VRecipF32Op,
                 npu::VSigmoidF32Op, npu::VMaxF32Op,
                 npu::MOVEVF32Op, npu::BlockIdOp, npu::BlockNumOp,
                 npu::LoadF32Op, npu::AtomicAddF32Op,
+                npu::MlpOp, npu::TransposeOp, npu::ReshapeFilterOp,
                 npu::AllocaOp>(
               [&](auto op) { return printNPUOp(*this, op); })
           .Default([&](Operation *) {
