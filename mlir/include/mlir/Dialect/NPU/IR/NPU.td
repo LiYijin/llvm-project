@@ -224,6 +224,9 @@ def NPU_BlockIdOp : NPU_Op<"block_id", [Pure]> {
     The `npu.block_id` operation returns the block id.
   }];
 
+  let arguments = (ins
+    StrAttr:$dimension);
+
   let results = (outs I64:$res);
 }
 
@@ -232,6 +235,9 @@ def NPU_BlockNumOp : NPU_Op<"block_num", [Pure]> {
   let description = [{
     The `npu.block_num` operation returns the block num.
   }];
+
+  let arguments = (ins
+    StrAttr:$dimension);
 
   let results = (outs I64:$res);
 }

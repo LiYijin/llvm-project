@@ -1202,7 +1202,7 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   if (failed(emitter.emitAssignPrefix(*blockId.getOperation())))
     return failure();
   
-  os << "taskId";
+  os << "taskId" << blockId.getDimension();
   return success();
 }
 
@@ -1213,7 +1213,7 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   if (failed(emitter.emitAssignPrefix(*blockNum.getOperation())))
     return failure();
                                   
-  os << "taskDim";
+  os << "taskDim" << blockNum.getDimension();
   return success();
 }
 
