@@ -1311,6 +1311,18 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   return success();           
 }
 
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::VReduceF32Op op) {
+  auto &os = emitter.ostream();
+  if (failed(emitter.emitAssignPrefix(*op.getOperation())))
+    return failure();
+  
+  os << "__cn_vector_reduce_"
+     << op.getKind() << "_f32(" << emitter.getOrCreateName(op.getInput())
+     << ", " << op.getNumElems() << ")";
+  return success();
+} 
+
 static LogicalResult printBinaryOperation(CppEmitter &emitter,
                                           Operation *operation,
                                           StringRef binaryOperator) {
@@ -2345,7 +2357,7 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
                 npu::MOVEVF32Op, npu::BlockIdOp, npu::BlockNumOp,
                 npu::LoadF32Op, npu::AtomicAddF32Op,
                 npu::MlpOp, npu::TransposeOp, npu::ReshapeFilterOp,
-                npu::AllocaOp>(
+                npu::AllocaOp, npu::VReduceF32Op>(
               [&](auto op) { return printNPUOp(*this, op); })
           .Default([&](Operation *) {
             return op.emitOpError("unable to find printer for op");

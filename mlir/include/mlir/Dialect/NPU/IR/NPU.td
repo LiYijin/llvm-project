@@ -393,4 +393,16 @@ def TransposeOp : NPU_Op<"transpose", [Pure]> {
   let results = (outs AnyVector:$res);
 }
 
+def VReduceF32Op : NPU_Op<"vreduce_f32", [Pure]> {
+  let summary = "Perform 1D vector reduce operation.";
+  let description = [{}];
+
+  let arguments = (ins
+    AnyVector:$input,
+    I32Attr:$numElems,
+    StrAttr:$kind);
+  
+  let results = (outs F32:$res);
+}
+
 #endif // NPU_DIALECT
