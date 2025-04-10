@@ -137,12 +137,6 @@ void VMaxF32Op::build(mlir::OpBuilder &builder, mlir::OperationState &state,
   VMaxF32Op::build(builder, state, resType, lhs, rhs, numElements);
 }
 
-void VAddSF32Op::build(mlir::OpBuilder &builder, mlir::OperationState &state,
-                      Value lhs, Value rhs, IntegerAttr numElements) {
-  auto resType = lhs.getType();
-  VAddSF32Op::build(builder, state, resType, lhs, rhs, numElements);
-}
-
 //===----------------------------------------------------------------------===//
 // VTanhF32Op
 //===----------------------------------------------------------------------===//

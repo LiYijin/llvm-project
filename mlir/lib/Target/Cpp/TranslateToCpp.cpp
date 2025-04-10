@@ -1100,14 +1100,17 @@ static LogicalResult printNPUBinOp(CppEmitter &emitter,
       .Cases("vsub_f32", "vsub", "__bang_sub")
       .Cases("vmul_f32", "vmul", "__bang_mul")
       .Cases("vdiv_f32", "vdiv", "__bang_div")
-      .Case("vadds_f32", "__bang_add_scalar")
-      .Case("vmuls_f32", "__bang_mul_scalar")
       .Default("");
   
   if (intrinsic.empty())
     return npuBinOp->emitOpError("ICT_ERROR(): unknown binary op!");
   
-  os << intrinsic << "(";
+  os << intrinsic;
+
+  if (!isa<VectorType>(npuBinOp.getRhs().getType()))
+    os << "_scalar";
+  
+  os << "(";
 
   auto dstType = npuBinOp.getType();
   auto dstElemType = dstType.getElementType();
@@ -1151,8 +1154,6 @@ static LogicalResult printNPUOp(CppEmitter &emitter,\
 DEFINE_NPU_BINOP_EMITTER(VAddF32Op)
 DEFINE_NPU_BINOP_EMITTER(VSubF32Op)
 DEFINE_NPU_BINOP_EMITTER(VMulF32Op)
-DEFINE_NPU_BINOP_EMITTER(VAddSF32Op)
-DEFINE_NPU_BINOP_EMITTER(VMulSF32Op)
 // DEFINE_NPU_BINOP_EMITTER(VDivF32Op)
 
 #undef DEFINE_NPU_BINOP_EMITTER
@@ -1220,6 +1221,9 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
 static LogicalResult printNPUOp(CppEmitter &emitter,
                                 npu::AllocaOp allocaOp) {
   auto &os = emitter.ostream();
+
+  if (allocaOp->use_empty())
+    os << "// ";
 
   os << "__nram__ int8_t "
      << emitter.getOrCreateName(allocaOp) << "["
@@ -1317,11 +1321,36 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   if (failed(emitter.emitAssignPrefix(*op.getOperation())))
     return failure();
   
-  os << "__cn_vector_reduce_"
-     << op.getKind() << "_f32(" << emitter.getOrCreateName(op.getInput())
+  os << "__cn_vector_reduce_" << op.getKind()
+     << "_f32((float*)" << emitter.getOrCreateName(op.getInput())
      << ", " << op.getNumElems() << ")";
   return success();
-} 
+}
+
+static LogicalResult printNPUOp(CppEmitter &emitter,
+                                npu::VFusionF32Op op) {
+  auto &os = emitter.ostream();
+  auto result = op->getResult(0);
+
+  if (!emitter.shouldDeclareVariablesAtTop()) {
+    if (failed(emitter.emitVariableDeclaration(result, true)))
+      return failure();
+  }
+
+  os << "__bang_fusion(" << op.getKind() << ", "
+     << emitter.getOrCreateName(result) << ", "
+     << emitter.getOrCreateName(op.getSrc0()) << ", "
+     << emitter.getOrCreateName(op.getSrc1()) << ", "
+     << emitter.getOrCreateName(op.getSrc2()) << ", "
+     << op.getNumSrcElems();
+  
+  if (op.getNumSegElems().has_value()) {
+    os << ", " << op.getNumSegElems().value();
+  }
+
+  os << ")";
+  return success();
+}
 
 static LogicalResult printBinaryOperation(CppEmitter &emitter,
                                           Operation *operation,
@@ -2244,10 +2273,13 @@ LogicalResult CppEmitter::emitVariableDeclaration(OpResult result,
     return result.getDefiningOp()->emitError(
         "result variable for the operation already declared");
   }
-  if (result.getType().isa<VectorType>()) {
-    auto owner = result.getOwner();
+
+  auto owner = result.getOwner();
+
+  if (isa<VectorType>(result.getType()) &&
+      !isa<UnrealizedConversionCastOp>(owner)) {
+    auto vecType = cast<VectorType>(result.getType());
     os << "__nram__ ";
-    auto vecType =  dyn_cast<VectorType>(result.getType());
     // For MLU device, we treat vector type as its element type
     if (failed(emitType(owner->getLoc(), vecType.getElementType())))
       return failure();
@@ -2255,6 +2287,7 @@ LogicalResult CppEmitter::emitVariableDeclaration(OpResult result,
     os << "[" << vecType.getNumElements() << "];\n";
     return success();
   }
+
   if (failed(emitType(result.getOwner()->getLoc(), result.getType())))
     return failure();
   os << " " << getOrCreateName(result);
@@ -2351,13 +2384,12 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
           .Case<npu::MovOutToUBOp, npu::MovUBToOutOp,
                 npu::MovUBToUBWriteOp, npu::MovUBToUBReadOp,
                 npu::VAddF32Op, npu::VSubF32Op, npu::VMulF32Op,
-                npu::VAddSF32Op, npu::VMulSF32Op,
                 npu::VTanhF32Op, npu::VExpF32Op, npu::VRecipF32Op,
                 npu::VSigmoidF32Op, npu::VMaxF32Op,
                 npu::MOVEVF32Op, npu::BlockIdOp, npu::BlockNumOp,
                 npu::LoadF32Op, npu::AtomicAddF32Op,
                 npu::MlpOp, npu::TransposeOp, npu::ReshapeFilterOp,
-                npu::AllocaOp, npu::VReduceF32Op>(
+                npu::AllocaOp, npu::VReduceF32Op, npu::VFusionF32Op>(
               [&](auto op) { return printNPUOp(*this, op); })
           .Default([&](Operation *) {
             return op.emitOpError("unable to find printer for op");

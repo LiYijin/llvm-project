@@ -28,7 +28,9 @@ def VAddF32Op : NPU_Op<"vadd", [Pure]> {
     The `vadd` operation adds two vectors element-wise.
   }];
 
-  let arguments = (ins AnyVector:$lhs, AnyVector:$rhs, I32Attr:$numElems);
+  let arguments = (ins AnyVector:$lhs,
+                       AnyTypeOf<[AnyVector, F32]>:$rhs,
+                       I32Attr:$numElems);
   let results = (outs AnyVector:$res);
 
   let builders = [
@@ -42,7 +44,9 @@ def VSubF32Op : NPU_Op<"vsub_f32", [Pure]> {
     The `vsub_f32` operation subs two vectors element-wise.
   }];
 
-  let arguments = (ins AnyVector:$lhs, AnyVector:$rhs, I32Attr:$numElems);
+  let arguments = (ins AnyVector:$lhs,
+                       AnyTypeOf<[AnyVector, F32]>:$rhs,
+                       I32Attr:$numElems);
   let results = (outs AnyVector:$res);
 
   let builders = [
@@ -56,7 +60,9 @@ def VMulF32Op : NPU_Op<"vmul_f32", [Pure]> {
     The `vmul_f32` operation muls two vectors element-wise.
   }];
 
-  let arguments = (ins AnyVector:$lhs, AnyVector:$rhs, I32Attr:$numElems);
+  let arguments = (ins AnyVector:$lhs,
+                       AnyTypeOf<[AnyVector, F32]>:$rhs,
+                       I32Attr:$numElems);
   let results = (outs AnyVector:$res);
 
   let builders = [
@@ -143,36 +149,6 @@ def VMaxF32Op : NPU_Op<"vmax_f32", [Pure]> {
   }];
 
   let arguments = (ins AnyVector:$lhs, AnyVector:$rhs, I32Attr:$numElems);
-  let results = (outs AnyVector:$res);
-
-  let builders = [
-    OpBuilder<(ins "Value":$lhs, "Value":$rhs, "IntegerAttr":$numElems)>
-  ];
-}
-
-// Note: Now VAddSF32Op and VMulSF32Op are not used in the codebase, 
-// waiting for further optimization.
-def VAddSF32Op : NPU_Op<"vadds_f32", [Pure]> {
-  let summary = "Vector float32 add scalar operation";
-  let description = [{
-    The `vadds_f32` operation adds a scalar to a vector element-wise.
-  }];
-
-  let arguments = (ins AnyVector:$lhs, F32:$rhs, I32Attr:$numElems);
-  let results = (outs AnyVector:$res);
-
-  let builders = [
-    OpBuilder<(ins "Value":$lhs, "Value":$rhs, "IntegerAttr":$numElems)>
-  ];
-}
-
-def VMulSF32Op : NPU_Op<"vmuls_f32", [Pure]> {
-  let summary = "Vector float32 mul scalar operation";
-  let description = [{
-    The `vmuls_f32` operation muls a scalar to a vector element-wise.
-  }];
-
-  let arguments = (ins AnyVector:$lhs, F32:$rhs, I32Attr:$numElems);
   let results = (outs AnyVector:$res);
 
   let builders = [
@@ -403,6 +379,41 @@ def VReduceF32Op : NPU_Op<"vreduce_f32", [Pure]> {
     StrAttr:$kind);
   
   let results = (outs F32:$res);
+}
+
+def VFusionF32Op : NPU_Op<"vfusion_f32", [Pure]> {
+  let summary = "Perform  fused arithmetic calculation on vectors according to `op_code`.";
+  
+  let description = [{
+    This function performs fused arithmetic calculation on vectors <src0> , <src1> and <src2> element-wisely
+    according to <op_code> and saves the result in <dst>. <op_code> indicates the type of operator. 
+    <op_code> is assigned to an enumerated type called mluFusionOpCode that contains eight enumerators.
+
+    /------------+-----------------------------------------------\
+    | Type       |   Semantic                                    |
+    +------------+-----------------------------------------------+
+    | FUSION_FMA | <dst> = <src0> x <src1> + <src2>              |
+    +------------+-----------------------------------------------+
+    | FUSION_FMS | <dst> = <src0> x <src1> - <src2>              |
+    +------------+-----------------------------------------------+
+    + ... ...    + ... ...                                       |
+    +------------+-----------------------------------------------+
+    | FUSION_FSA | <dst> = <src0> - <src1> + <src2>              |
+    \------------+-----------------------------------------------/
+
+    NOTE: For the last two characters of enumerators,
+    `M` means multiplication, `A` means addition and `S` means subtraction.
+  }];
+
+  let arguments = (ins
+    AnyVector:$src0,
+    AnyTypeOf<[AnyVector, F32]>:$src1,
+    AnyTypeOf<[AnyVector, F32]>:$src2,
+    StrAttr:$kind,
+    I32Attr:$numSrcElems,
+    OptionalAttr<I32Attr>:$numSegElems);
+  
+  let results = (outs AnyVector:$res);
 }
 
 #endif // NPU_DIALECT
