@@ -1034,13 +1034,31 @@ static LogicalResult printNPUOp(CppEmitter &emitter, npu::AtomicAddF32Op op) {
   return success();
 }
 
+// Check whether `result` is only used to be stored into another nram buffer,
+// if so, replace it with the target nram buffer. Do this optimization will
+// save a temp nram buffer and a nram2nram memcpy.
+static bool reuseBuffer(CppEmitter &emitter, OpResult result) {
+  if (!isa<VectorType>(result.getType()))
+    return false;
+
+  auto nextOp = result.getOwner()->getNextNode();
+  if (auto op = dyn_cast_or_null<npu::MovUBToUBWriteOp>(nextOp)) {
+    if (op.getValueToStore() == result) {
+      emitter.createValueName(result, emitter.getOrCreateName(op.getDstAddr()));
+      op->erase();
+      return true;
+    }
+  }
+  return false;
+}
+
 // Generic emitter for npu unary operations.
 template <typename OpTy>
 static LogicalResult printNPUUnaryOp(CppEmitter &emitter,
                                      OpTy npuUOp) {
   auto &os = emitter.ostream();
   auto result = npuUOp->getResult(0);
-  if (!emitter.shouldDeclareVariablesAtTop()) {
+  if (!emitter.shouldDeclareVariablesAtTop() && !reuseBuffer(emitter, result)) {
     if (failed(emitter.emitVariableDeclaration(result, true)))
       return failure();
   }
@@ -1085,7 +1103,8 @@ static LogicalResult printNPUBinOp(CppEmitter &emitter,
                                    OpTy npuBinOp) {
   auto &os = emitter.ostream();
   auto result = npuBinOp->getResult(0);
-  if (!emitter.shouldDeclareVariablesAtTop()) {
+  
+  if (!emitter.shouldDeclareVariablesAtTop() && !reuseBuffer(emitter, result)) {
     if (failed(emitter.emitVariableDeclaration(result, true)))
       return failure();
   }
@@ -1175,7 +1194,7 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
                                 npu::MOVEVF32Op op) {
   auto &os = emitter.ostream();
   auto result = op->getResult(0);
-  if (!emitter.shouldDeclareVariablesAtTop()) {
+  if (!emitter.shouldDeclareVariablesAtTop() && !reuseBuffer(emitter, result)) {
     if (failed(emitter.emitVariableDeclaration(result, true)))
       return failure();
   }
@@ -1253,11 +1272,6 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   auto &os = emitter.ostream();
   auto result = reshapeOp->getResult(0);
 
-  // if (!emitter.shouldDeclareVariablesAtTop()) {
-  //   if (failed(emitter.emitVariableDeclaration(result, true)))
-  //     return failure();
-  // }
-
   auto input = reshapeOp.getInput();
   auto transOp = input.getDefiningOp<npu::TransposeOp>();
   assert(transOp != nullptr && "Input of reshape_filter is not a transpose!");
@@ -1332,7 +1346,7 @@ static LogicalResult printNPUOp(CppEmitter &emitter,
   auto &os = emitter.ostream();
   auto result = op->getResult(0);
 
-  if (!emitter.shouldDeclareVariablesAtTop()) {
+  if (!emitter.shouldDeclareVariablesAtTop() && !reuseBuffer(emitter, result)) {
     if (failed(emitter.emitVariableDeclaration(result, true)))
       return failure();
   }
